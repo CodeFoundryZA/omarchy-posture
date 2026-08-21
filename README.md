@@ -176,6 +176,29 @@ matches no preset lights up the nearest one.
 Per-metric tolerances live under `tolerance` in the config file if you want to
 loosen one axis on its own without touching the others.
 
+## Moving the laptop
+
+The metrics split in two. `neckRatio` and `earNeckRatio` divide by shoulder
+width, so they measure your body against itself and survive the camera moving;
+measured across a real session they sat 0.4% from baseline while sitting well.
+`scale`, `frameY` and the two tilts describe where you sit in the frame, so
+nudging the screen moves them whatever your posture is doing.
+
+So the daemon watches for the one pattern that can only mean the camera moved:
+the framing metrics shifting past their tolerance while the scale-invariant
+ones hold steady. When it sees that sustained over a dozen samples, it
+re-anchors only the framing baselines and keeps your calibrated `neckRatio`.
+No prompt, no recalibration, and the event is recorded in `daemon.log`.
+
+The condition is deliberately asymmetric. If your body geometry had really
+changed, `neckRatio` would have moved too and nothing happens, which is what
+stops this quietly re-baselining a slouch into the new normal. Set
+`drift.autoReanchor` to `false` to turn it off.
+
+You still want a full `posture calibrate` after a real setup change, such as a
+different desk or chair height. This handles the laptop being nudged, not a
+different sitting position.
+
 ## States
 
 | State | Meaning |

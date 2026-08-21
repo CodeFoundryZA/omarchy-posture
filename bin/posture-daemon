@@ -105,6 +105,14 @@ DEFAULT_CONFIG = {
         "shoulderTiltDeg": 9.0,
         "headTiltDeg": 13.0,
     },
+    # Camera movement handling. See DriftTracker: only the framing-dependent
+    # baselines are ever re-anchored, and only while the scale-invariant
+    # metrics confirm the body itself has not changed.
+    "drift": {
+        "autoReanchor": True,
+        "windowSamples": 12,
+        "cooldownSeconds": 120,
+    },
     "baseline": None,
     "camera": {
         "width": 640,
@@ -521,6 +529,90 @@ def sample(cfg: dict, engine: PoseEngine):
     }
 
 
+# ---------------------------------------------------------------- drift -----
+
+class DriftTracker:
+    """Re-anchor framing-dependent baselines when the camera moves.
+
+    The metrics split cleanly in two. `neckRatio` and `earNeckRatio` divide by
+    shoulder width, so they measure the body against itself and survive the
+    laptop being moved: measured across a real session they sat 0.4% from
+    baseline while the user was sitting well. `scale`, `frameY` and the two
+    tilts describe where the body sits in the frame, so nudging the screen
+    moves them regardless of posture; `frameY` alone drifted 8% against a 7%
+    tolerance without the user moving at all, which is why "sinking down in the
+    chair" became the second most common false alarm.
+
+    So a sustained shift in the framing metrics while the scale-invariant ones
+    hold steady is the camera moving, not the person slouching. That is the
+    only condition under which the framing baselines are re-anchored, which is
+    what stops this from quietly normalising bad posture: if the body geometry
+    had really changed, `neckRatio` would have moved too and nothing happens.
+    """
+
+    FRAMING_KEYS = ("scale", "frameY", "shoulderTiltDeg", "headTiltDeg")
+    ANCHOR_KEY = "neckRatio"
+
+    def __init__(self):
+        self.samples: list = []
+        self.last_reanchor = 0.0
+
+    def reset(self):
+        self.samples = []
+
+    def observe(self, metrics: dict, cfg: dict, now: float) -> str | None:
+        if not metrics or not cfg.get("baseline"):
+            return None
+        drift = cfg.get("drift", {})
+        if not drift.get("autoReanchor", True):
+            return None
+
+        window = int(drift.get("windowSamples", 12))
+        self.samples.append(metrics)
+        self.samples = self.samples[-window:]
+        if len(self.samples) < window:
+            return None
+        if now - self.last_reanchor < float(drift.get("cooldownSeconds", 120)):
+            return None
+
+        base = cfg["baseline"]
+        sens = max(0.2, float(cfg.get("sensitivity", 1.0)))
+        tol = cfg.get("tolerance", {})
+
+        def med(key):
+            return statistics.median([s[key] for s in self.samples if key in s])
+
+        # The body must look unchanged, and comfortably so: half the slouch
+        # allowance, not the full one.
+        anchor_base = base.get(self.ANCHOR_KEY)
+        if not anchor_base:
+            return None
+        anchor_shift = abs(med(self.ANCHOR_KEY) - anchor_base) / abs(anchor_base)
+        if anchor_shift > (float(tol.get("neckRatio", 0.14)) / sens) * 0.5:
+            return None
+
+        # At least one framing metric must have moved beyond its own budget.
+        moved = []
+        scale_shift = abs(med("scale") - base["scale"]) / max(1e-6, abs(base["scale"]))
+        if scale_shift > float(tol.get("scale", 0.16)) / sens:
+            moved.append(f"scale {scale_shift:+.0%}")
+        frame_shift = med("frameY") - base["frameY"]
+        if abs(frame_shift) > float(tol.get("frameY", 0.07)) / sens:
+            moved.append(f"frameY {frame_shift:+.3f}")
+        if not moved:
+            return None
+
+        for key in self.FRAMING_KEYS:
+            if key in base:
+                base[key] = med(key)
+        cfg["baseline"] = base
+        cfg["lastReanchoredAt"] = now
+        save_config(cfg)
+        self.last_reanchor = now
+        self.reset()
+        return "camera moved, re-anchored framing baselines (" + ", ".join(moved) + ")"
+
+
 # --------------------------------------------------------------- history ----
 
 TRACKED_STATES = ("good", "bad", "away", "paused", "blocked")
@@ -678,6 +770,7 @@ def run_daemon() -> int:
     bad_streak = away_streak = good_streak = 0
     last_notified = 0.0
     history = History()
+    drift = DriftTracker()
     last_tick = time.time()
     current_detail = ""       # reason attached to the state currently in force
 
@@ -691,6 +784,17 @@ def run_daemon() -> int:
             result = {"observation": "unavailable", "reason": "sample error"}
 
         obs = result["observation"]
+
+        # A camera move changes what "baseline" means, so any bad streak built
+        # against the old framing is meaningless and must not survive it.
+        if obs in ("good", "bad"):
+            moved = drift.observe(result.get("metrics"), cfg, time.time())
+            if moved:
+                log(moved)
+                cfg = load_config()   # pick up the baseline just written
+                bad_streak = 0
+        else:
+            drift.reset()
 
         if obs == "bad":
             bad_streak += 1
