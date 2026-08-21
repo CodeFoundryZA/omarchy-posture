@@ -8,8 +8,6 @@ Runs entirely on your machine. No images are ever written to disk or sent
 anywhere: frames live in memory for the fraction of a second they are analysed
 and are then discarded. Only numbers are stored.
 
-![Posture widget and panel](preview.png)
-
 ## Requirements
 
 - Omarchy 4 (Quattro) with the Quickshell shell

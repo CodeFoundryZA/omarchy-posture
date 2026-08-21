@@ -3,8 +3,8 @@
   "id": "io.github.codefoundryza.posture",
   "name": "Posture",
   "version": "1.0.0",
-  "author": "Nathan",
-  "description": "Watches your posture with the webcam and warns when you slouch.",
+  "author": "Nathan Grobler",
+  "description": "Webcam posture monitor. Turns the bar red and notifies you when you start slouching. Runs fully offline and never stores images.",
   "kinds": [
     "service",
     "bar-widget"
@@ -24,7 +24,13 @@
       "showLabel": false
     },
     "schema": [
-      { "key": "showLabel", "type": "boolean", "label": "Show text label next to the icon" }
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show text label next to the icon"
+      }
     ]
-  }
+  },
+  "homepage": "https://github.com/CodeFoundryZA/omarchy-posture",
+  "license": "MIT"
 }
