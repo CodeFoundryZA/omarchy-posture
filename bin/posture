@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Control surface for the Omarchy posture monitor.
+
+set -uo pipefail
+
+plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/posture"
+state_file="$state_dir/state.json"
+config_file="$state_dir/config.json"
+pause_file="$state_dir/pause"
+log_file="$state_dir/daemon.log"
+daemon="$plugin_dir/bin/posture-daemon"
+unit="omarchy-posture.service"
+
+mkdir -p "$state_dir"
+
+usage() {
+  cat <<'EOF'
+Usage: posture <command>
+
+  status       Current posture state
+  start        Start the monitor
+  stop         Stop the monitor
+  restart      Restart the monitor
+  calibrate    Record your good-posture baseline (stops/starts the monitor)
+  pause        Suspend sampling (camera is left alone)
+  resume       Resume sampling
+  toggle       Pause or resume
+  sensitivity  Show or set strictness, e.g. "posture sensitivity 1.4"
+  history      Posture history: today, last 12 hours, last 7 days
+  once         Take one sample and print JSON
+  probe        Check camera health
+  logs         Follow the daemon log
+EOF
+}
+
+running() { systemctl --user is-active --quiet "$unit"; }
+
+cmd_status() {
+  if [[ ! -f $state_file ]]; then
+    echo "no state yet (is the monitor running? try: posture start)"
+    return 1
+  fi
+  jq -r '
+    "state:      \(.state)",
+    "detail:     \(.detail)",
+    "for:        \((now - .since) | floor | tostring + "s")",
+    "calibrated: \(.calibrated)",
+    "updated:    \((now - .updatedAt) | floor | tostring + "s ago")"
+  ' "$state_file"
+  if [[ -n ${1:-} ]]; then jq -r '.metrics // {} | to_entries[] | "  \(.key): \(.value)"' "$state_file"; fi
+}
+
+case "${1:-status}" in
+status) cmd_status "${2:-}" ;;
+start)
+  systemctl --user start "$unit" && echo "posture monitor started"
+  ;;
+stop)
+  systemctl --user stop "$unit" && echo "posture monitor stopped"
+  ;;
+restart)
+  systemctl --user restart "$unit" && echo "posture monitor restarted"
+  ;;
+calibrate)
+  was_running=0
+  running && was_running=1
+  ((was_running)) && systemctl --user stop "$unit"
+  "$daemon" calibrate --samples "${2:-10}"
+  rc=$?
+  ((was_running)) && systemctl --user start "$unit"
+  exit $rc
+  ;;
+pause)
+  touch "$pause_file" && echo "posture monitor paused"
+  ;;
+resume)
+  rm -f "$pause_file" && echo "posture monitor resumed"
+  ;;
+toggle)
+  if [[ -f $pause_file ]]; then rm -f "$pause_file"; echo "resumed"; else touch "$pause_file"; echo "paused"; fi
+  ;;
+sensitivity)
+  if [[ -z ${2:-} ]]; then
+    jq -r '.sensitivity // 1.0 | "sensitivity: \(.)"' "$config_file" 2>/dev/null || echo "sensitivity: 1.0"
+  else
+    # Keep it inside the range the panel slider can actually represent,
+    # otherwise the slider pins at an end and silently misreports the value.
+    if ! awk -v v="$2" 'BEGIN{exit !(v+0==v && v>=0.5 && v<=2.5)}' </dev/null; then
+      echo "sensitivity must be a number between 0.5 and 2.5 (got: $2)" >&2
+      exit 1
+    fi
+    tmp=$(mktemp)
+    if [[ -f $config_file ]]; then jq --argjson s "$2" '.sensitivity = $s' "$config_file" >"$tmp"
+    else printf '{"sensitivity": %s}\n' "$2" >"$tmp"; fi
+    mv "$tmp" "$config_file"
+    echo "sensitivity set to $2"
+  fi
+  ;;
+history) shift; "$daemon" history "$@" ;;
+once) "$daemon" once ;;
+probe) "$daemon" probe ;;
+logs) tail -f "$log_file" ;;
+-h | --help | help) usage ;;
+*)
+  echo "Unknown command: $1" >&2
+  usage
+  exit 1
+  ;;
+esac

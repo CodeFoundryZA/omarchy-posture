@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""Omarchy posture monitor.
+
+Samples the webcam on a low duty cycle, estimates head and shoulder geometry
+with BlazePose (run through OpenCV's DNN module), compares the result against a
+calibrated baseline, and drives a JSON state file that the Quickshell bar
+widget reflects. Notifications are sent from here so the feature keeps working
+across an "omarchy restart shell".
+
+Subcommands:
+  run         daemon loop (used by the systemd user service)
+  once        take a single sample and print the result as JSON
+  calibrate   record the baseline for good posture
+  probe       report camera health only, no inference
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/posture"
+CONFIG_PATH = STATE_DIR / "config.json"
+STATE_PATH = STATE_DIR / "state.json"
+PAUSE_PATH = STATE_DIR / "pause"
+LOG_PATH = STATE_DIR / "daemon.log"
+HISTORY_PATH = STATE_DIR / "history.jsonl"   # raw metric samples, for trends
+SUMMARY_PATH = STATE_DIR / "summary.json"    # rolled up buckets, for the panel
+
+# Rollup retention. Hours drive the in-panel sparkline, days drive the longer
+# trend, and raw samples are the fallback if either ever needs rebuilding.
+KEEP_DAYS = 90
+KEEP_HOURS = 72
+KEEP_SAMPLES = 20000
+
+DEVICE = "/dev/video0"
+
+# BlazePose landmark indices we care about.
+NOSE, EAR_L, EAR_R, SHOULDER_L, SHOULDER_R = 0, 7, 8, 11, 12
+
+# A frame whose grayscale standard deviation is below this carries no image
+# content. The webcam's "brightness" control adds a flat DC offset, so mean
+# brightness alone cannot tell a real dim image from a covered sensor.
+BLANK_STD = 3.0
+
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a") as fh:
+            fh.write(line + "\n")
+        if LOG_PATH.stat().st_size > 512 * 1024:
+            tail = LOG_PATH.read_text().splitlines()[-2000:]
+            LOG_PATH.write_text("\n".join(tail) + "\n")
+    except OSError:
+        pass
+    if os.environ.get("POSTURE_DEBUG"):
+        print(line, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- config ----
+
+DEFAULT_CONFIG = {
+    # Adaptive cadence. A sample costs about 0.7s wall clock, almost all of it
+    # the first read after opening the device, so the interval is what governs
+    # how fast a slouch is caught. Sampling stays lazy while nothing is wrong
+    # and tightens as soon as one bad reading shows up, which keeps the webcam
+    # LED and the duty cycle low without making detection sluggish.
+    "intervalSeconds": 6,       # steady state, posture is fine
+    "fastIntervalSeconds": 2,   # a bad reading is pending confirmation
+    "awayIntervalSeconds": 15,  # nobody at the desk, no hurry
+    "graceSamples": 3,          # consecutive bad samples before alerting
+    "awaySamples": 3,           # consecutive no-person samples before "away"
+    "renotifySeconds": 300,
+    "sensitivity": 1.0,         # higher is stricter
+    "minConfidence": 0.4,
+    "framesPerSample": 3,
+    # Desk geometry: the sitter's hips are below the bottom of the frame.
+    # These fractions define the synthetic ROI handed to the pose model.
+    "roi": {
+        "centerXFrac": 0.5,
+        "centerYFrac": 1.4,
+        "halfSizeFrac": 1.3,
+    },
+    "tolerance": {
+        "neckRatio": 0.14,      # fraction below baseline that counts as slouch
+        "scale": 0.16,          # fraction above baseline that counts as leaning in
+        "frameY": 0.07,         # absolute rise of shoulder line in frame
+        "shoulderTiltDeg": 9.0,
+        "headTiltDeg": 13.0,
+    },
+    "baseline": None,
+    "camera": {
+        "width": 640,
+        "height": 480,
+        "warmupFrames": 25,
+        "manualExposureFallback": True,
+    },
+}
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def config_mtime() -> float:
+    try:
+        return CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def sleep_until_config_changes(seconds: float, slice_seconds: float = 0.25) -> bool:
+    """Sleep, but wake early if the config file is edited.
+
+    The panel writes a setting and then waits for the daemon to echo it back
+    before it trusts the change. Sleeping the full interval made that take up to
+    six seconds, long enough that a control looked like it had ignored the
+    click. Returns True when it woke early.
+    """
+    start = config_mtime()
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(min(slice_seconds, max(0.0, deadline - time.time())))
+        if config_mtime() != start:
+            return True
+    return False
+
+
+def load_config() -> dict:
+    try:
+        user = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        user = {}
+    return deep_merge(DEFAULT_CONFIG, user)
+
+
+def save_config(cfg: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    write_atomic(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+
+
+def write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- guards ----
+
+def session_locked() -> bool:
+    session = os.environ.get("XDG_SESSION_ID", "")
+    if not session:
+        try:
+            session = subprocess.run(
+                ["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Display", "--value"],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if not session:
+        return False
+    try:
+        out = subprocess.run(["loginctl", "show-session", session, "-p", "LockedHint", "--value"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out == "yes"
+
+
+def camera_busy() -> bool:
+    """True when a process other than us holds the capture device."""
+    try:
+        out = subprocess.run(["fuser", DEVICE], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pids = {p for p in out.stdout.split() if p.isdigit()}
+    pids.discard(str(os.getpid()))
+    return bool(pids)
+
+
+def paused() -> bool:
+    return PAUSE_PATH.exists()
+
+
+# ---------------------------------------------------------------- camera ----
+
+def v4l2_set(*controls: str) -> None:
+    try:
+        args = ["v4l2-ctl", "-d", DEVICE]
+        for control in controls:
+            args += ["-c", control]
+        subprocess.run(args, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+class Camera:
+    """Duty-cycled capture: open, grab a usable frame, close.
+
+    The device is released between samples so video calls are never blocked.
+    Auto exposure on this class of UVC webcam does not always converge, so a
+    manual exposure ramp is used as a fallback before declaring the sensor
+    blocked.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg.get("camera", {})
+
+    def grab(self, count: int = 1):
+        """Return (frames, error). Frames are usable, non-blank captures."""
+        import cv2 as cv
+
+        width = self.cfg.get("width", 640)
+        height = self.cfg.get("height", 480)
+        warmup = self.cfg.get("warmupFrames", 25)
+
+        v4l2_set("auto_exposure=3")  # aperture priority (auto)
+        cap = cv.VideoCapture(0, cv.CAP_V4L2)
+        if not cap.isOpened():
+            return [], "camera-unavailable"
+        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
+
+        best, best_std = None, -1.0
+        frames = []
+        try:
+            # Settle the stream, tracking the best frame in case it stays blank.
+            for _ in range(warmup):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                std = float(cv.cvtColor(frame, cv.COLOR_BGR2GRAY).std())
+                if std > best_std:
+                    best, best_std = frame, std
+                if std >= BLANK_STD * 4:
+                    break
+
+            if best_std < BLANK_STD and self.cfg.get("manualExposureFallback", True):
+                best, best_std = self._manual_ramp(cap, cv, best, best_std)
+
+            if best is not None and best_std >= BLANK_STD:
+                frames.append(best)
+                for _ in range(max(0, count - 1)):
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        frames.append(frame)
+        finally:
+            cap.release()
+            v4l2_set("auto_exposure=3", "gain=1", "brightness=0")
+
+        if best is None:
+            return [], "camera-unavailable"
+        if best_std < BLANK_STD:
+            return [], "camera-blocked"
+        return frames, None
+
+    def _manual_ramp(self, cap, cv, best, best_std):
+        """Hunt exposure manually when auto exposure fails to converge."""
+        v4l2_set("auto_exposure=1")
+        for exposure, gain in ((156, 2), (330, 4), (625, 6), (625, 8)):
+            v4l2_set(f"exposure_time_absolute={exposure}", f"gain={gain}")
+            for _ in range(4):
+                cap.read()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            std = float(cv.cvtColor(frame, cv.COLOR_BGR2GRAY).std())
+            if std > best_std:
+                best, best_std = frame, std
+            if std >= BLANK_STD * 4:
+                break
+        return best, best_std
+
+
+# ------------------------------------------------------------- inference ----
+
+class PoseEngine:
+    """BlazePose landmarks via OpenCV DNN, driven from a fixed ROI.
+
+    Upstream BlazePose runs a full-body person detector to find the region of
+    interest. That detector is trained on images containing most of a body and
+    is unreliable on a desk webcam, where only head and shoulders are visible:
+    measured here it fired on 3 of 14 frames, at confidences around 0.5.
+
+    A desk camera has fixed geometry, so the ROI does not need detecting. We
+    synthesise one that models the sitter's hips below the bottom of the frame,
+    which is what the geometry actually is. Measured on the same camera that
+    yields 6 of 6 frames at confidence 1.00 with about 1 percent metric noise,
+    and it drops the 12MB detector from the hot path entirely.
+
+    The pose model must run on the default (new) OpenCV 5.0 engine; the classic
+    engine cannot handle its NHWC convolutions at all.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._pose = None
+
+    def _load(self):
+        if self._pose is not None:
+            return
+        sys.path.insert(0, str(PLUGIN_DIR / "lib"))
+        from mp_pose import MPPose
+        pose_path = str(PLUGIN_DIR / "models/pose_estimation_mediapipe_2023mar.onnx")
+        self._pose = MPPose(pose_path, confThreshold=float(self.cfg.get("minConfidence", 0.4)))
+
+    def _roi(self, width, height):
+        """Synthetic person row: 4 bbox values, 8 keypoints, 1 score.
+
+        mp_pose derives its crop from keypoints[0] (mid hip) and keypoints[1]
+        (full body point). Putting the full body point directly above mid hip
+        makes the rotation angle exactly zero, so no needless warping happens.
+        """
+        import numpy as np
+        roi = self.cfg.get("roi", {})
+        cx = float(roi.get("centerXFrac", 0.5)) * width
+        cy = float(roi.get("centerYFrac", 1.4)) * height
+        d = float(roi.get("halfSizeFrac", 1.3)) * height
+
+        person = np.zeros(13, np.float32)
+        person[0:4] = [cx - d, cy - d, cx + d, cy + d]
+        person[4:6] = [cx, cy]          # mid hip
+        person[6:8] = [cx, cy - d]      # full body point, straight up
+        person[8:10] = [cx, cy]         # upper body points, unused for the crop
+        person[10:12] = [cx, cy - d / 2]
+        person[12] = 0.99
+        return person
+
+    def landmarks(self, frame):
+        import numpy as np
+        self._load()
+        height, width = frame.shape[:2]
+        result = self._pose.infer(frame, self._roi(width, height))
+        if result is None:
+            return None, 0.0
+        _, lm, _, _, _, conf = result
+        lm = np.asarray(lm)
+
+        # Guard against a confident-looking pose that is actually off frame.
+        for idx in (NOSE, SHOULDER_L, SHOULDER_R):
+            x, y = lm[idx][0], lm[idx][1]
+            if not (-0.15 * width <= x <= 1.15 * width and -0.15 * height <= y <= 1.15 * height):
+                return None, 0.0
+        return lm, float(conf)
+
+
+def metrics_from(lm, shape) -> dict:
+    """Scale invariant posture metrics. All distances divide by shoulder width."""
+    import numpy as np
+
+    height, width = shape[0], shape[1]
+    nose = lm[NOSE][:2]
+    ear_mid = (lm[EAR_L][:2] + lm[EAR_R][:2]) / 2.0
+    sh_l, sh_r = lm[SHOULDER_L][:2], lm[SHOULDER_R][:2]
+    sh_mid = (sh_l + sh_r) / 2.0
+    sh_width = float(np.linalg.norm(sh_l - sh_r))
+    if sh_width < 1e-3:
+        return {}
+
+    return {
+        # Vertical room between shoulder line and head. Slouching and craning
+        # both compress this, which makes it the primary signal.
+        "neckRatio": float((sh_mid[1] - nose[1]) / sh_width),
+        "earNeckRatio": float((sh_mid[1] - ear_mid[1]) / sh_width),
+        # Apparent size: grows as you lean toward the screen.
+        "scale": float(sh_width / width),
+        # Height of the shoulder line in frame: grows as you sink down.
+        "frameY": float(sh_mid[1] / height),
+        "shoulderTiltDeg": float(np.degrees(np.arctan2(sh_l[1] - sh_r[1], sh_l[0] - sh_r[0]))),
+        "headTiltDeg": float(np.degrees(np.arctan2(
+            lm[EAR_L][1] - lm[EAR_R][1], lm[EAR_L][0] - lm[EAR_R][0]))),
+    }
+
+
+def evaluate(m: dict, cfg: dict):
+    """Compare metrics against the calibrated baseline.
+
+    Returns (ok, reasons, deltas). Tolerances shrink as sensitivity rises.
+    """
+    baseline = cfg.get("baseline")
+    if not baseline:
+        return None, ["uncalibrated"], {}
+
+    sens = max(0.2, float(cfg.get("sensitivity", 1.0)))
+    tol = cfg.get("tolerance", {})
+    reasons, deltas = [], {}
+
+    def band(key, default):
+        return float(tol.get(key, default)) / sens
+
+    neck_drop = (baseline["neckRatio"] - m["neckRatio"]) / max(1e-6, baseline["neckRatio"])
+    deltas["neckDrop"] = neck_drop
+    if neck_drop > band("neckRatio", 0.14):
+        reasons.append("slouching (head dropped toward shoulders)")
+
+    scale_gain = (m["scale"] - baseline["scale"]) / max(1e-6, baseline["scale"])
+    deltas["scaleGain"] = scale_gain
+    if scale_gain > band("scale", 0.16):
+        reasons.append("leaning into the screen")
+
+    frame_rise = m["frameY"] - baseline["frameY"]
+    deltas["frameRise"] = frame_rise
+    if frame_rise > band("frameY", 0.07):
+        reasons.append("sinking down in the chair")
+
+    sh_tilt = abs(m["shoulderTiltDeg"] - baseline["shoulderTiltDeg"])
+    deltas["shoulderTilt"] = sh_tilt
+    if sh_tilt > band("shoulderTiltDeg", 9.0):
+        reasons.append("leaning to one side")
+
+    head_tilt = abs(m["headTiltDeg"] - baseline["headTiltDeg"])
+    deltas["headTilt"] = head_tilt
+    if head_tilt > band("headTiltDeg", 13.0):
+        reasons.append("head tilted")
+
+    return (len(reasons) == 0), reasons, deltas
+
+
+# ---------------------------------------------------------------- sample ----
+
+def sample(cfg: dict, engine: PoseEngine):
+    """One measurement. Returns a dict describing what was observed."""
+    if paused():
+        return {"observation": "paused", "reason": "manually paused"}
+    if session_locked():
+        return {"observation": "paused", "reason": "session locked"}
+    if camera_busy():
+        return {"observation": "paused", "reason": "camera in use by another app"}
+
+    count = max(1, int(cfg.get("framesPerSample", 3)))
+    frames, err = Camera(cfg).grab(count)
+    if err:
+        return {"observation": "unavailable", "reason": err}
+
+    # Median across a few frames from the same camera session. Single frames
+    # carry enough landmark jitter to trip thresholds on their own.
+    floor = float(cfg.get("minConfidence", 0.4))
+    readings = []
+    for frame in frames:
+        lm, conf = engine.landmarks(frame)
+        if lm is None or conf < floor:
+            continue
+        one = metrics_from(lm, frame.shape)
+        if one:
+            readings.append((conf, one))
+
+    if not readings:
+        return {"observation": "away", "reason": "no person detected"}
+
+    m = {k: statistics.median([r[k] for _, r in readings]) for k in readings[0][1]}
+    conf = statistics.median([c for c, _ in readings])
+
+    ok, reasons, deltas = evaluate(m, cfg)
+    if ok is None:
+        return {"observation": "uncalibrated", "metrics": m, "confidence": conf}
+    return {
+        "observation": "good" if ok else "bad",
+        "metrics": m,
+        "deltas": deltas,
+        "reasons": reasons,
+        "confidence": conf,
+    }
+
+
+# --------------------------------------------------------------- history ----
+
+TRACKED_STATES = ("good", "bad", "away", "paused", "blocked")
+
+
+class History:
+    """Time accounting per state, bucketed by hour and by day.
+
+    Every cycle contributes its own elapsed wall time to the bucket for
+    whatever state was in force, so the totals stay honest even though the
+    sampling interval is adaptive. Buckets are persisted directly, so nothing
+    needs replaying from the raw sample log on restart.
+    """
+
+    def __init__(self):
+        self.data = {"days": {}, "hours": {}, "episodes": [], "version": 1}
+        self.load()
+        self._last_sample_write = 0.0
+
+    def load(self):
+        try:
+            stored = json.loads(SUMMARY_PATH.read_text())
+            if isinstance(stored, dict):
+                for key in ("days", "hours"):
+                    if isinstance(stored.get(key), dict):
+                        self.data[key] = stored[key]
+                if isinstance(stored.get("episodes"), list):
+                    self.data["episodes"] = stored["episodes"][-500:]
+        except (OSError, ValueError):
+            pass
+
+    def add_time(self, state: str, seconds: float, now: float) -> None:
+        if state not in TRACKED_STATES or seconds <= 0:
+            return
+        # Ignore absurd gaps from suspend or a stopped daemon.
+        seconds = min(seconds, 300.0)
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        hour = time.strftime("%Y-%m-%dT%H", time.localtime(now))
+        for scope, key in (("days", day), ("hours", hour)):
+            bucket = self.data[scope].setdefault(key, {})
+            bucket[state] = round(bucket.get(state, 0.0) + seconds, 1)
+
+    def add_episode(self, state: str, started: float, ended: float, detail: str) -> None:
+        if state not in TRACKED_STATES:
+            return
+        self.data["episodes"].append({
+            "state": state,
+            "start": round(started, 1),
+            "seconds": round(ended - started, 1),
+            "detail": detail,
+        })
+        self.data["episodes"] = self.data["episodes"][-500:]
+
+    def add_sample(self, metrics: dict, state: str, now: float, every: float = 60.0) -> None:
+        """Append a raw metric row, rate limited, for longer term trends."""
+        if not metrics or now - self._last_sample_write < every:
+            return
+        self._last_sample_write = now
+        row = {"t": round(now, 1), "state": state}
+        row.update({k: round(float(v), 4) for k, v in metrics.items()})
+        try:
+            with HISTORY_PATH.open("a") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except OSError:
+            return
+        try:
+            if HISTORY_PATH.stat().st_size > 4 * 1024 * 1024:
+                lines = HISTORY_PATH.read_text().splitlines()[-KEEP_SAMPLES:]
+                write_atomic(HISTORY_PATH, "\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+    def prune(self, now: float) -> None:
+        day_cut = time.strftime("%Y-%m-%d", time.localtime(now - KEEP_DAYS * 86400))
+        hour_cut = time.strftime("%Y-%m-%dT%H", time.localtime(now - KEEP_HOURS * 3600))
+        self.data["days"] = {k: v for k, v in self.data["days"].items() if k >= day_cut}
+        self.data["hours"] = {k: v for k, v in self.data["hours"].items() if k >= hour_cut}
+
+    def save(self, now: float) -> None:
+        self.prune(now)
+        payload = dict(self.data)
+        payload["updatedAt"] = now
+        payload["today"] = self.day_totals(time.strftime("%Y-%m-%d", time.localtime(now)))
+        payload["recentHours"] = self.recent_hours(now, 12)
+        try:
+            write_atomic(SUMMARY_PATH, json.dumps(payload) + "\n")
+        except OSError:
+            pass
+
+    def day_totals(self, day: str) -> dict:
+        bucket = dict(self.data["days"].get(day, {}))
+        monitored = sum(bucket.get(s, 0.0) for s in ("good", "bad"))
+        bucket["monitored"] = round(monitored, 1)
+        bucket["goodPct"] = round(100.0 * bucket.get("good", 0.0) / monitored, 1) if monitored else None
+        eps = [e for e in self.data["episodes"]
+               if e["state"] == "bad"
+               and time.strftime("%Y-%m-%d", time.localtime(e["start"])) == day]
+        bucket["badEpisodes"] = len(eps)
+        bucket["longestBad"] = round(max((e["seconds"] for e in eps), default=0.0), 1)
+        return bucket
+
+    def recent_hours(self, now: float, count: int) -> list:
+        out = []
+        for i in range(count - 1, -1, -1):
+            stamp = now - i * 3600
+            key = time.strftime("%Y-%m-%dT%H", time.localtime(stamp))
+            b = self.data["hours"].get(key, {})
+            good, bad = b.get("good", 0.0), b.get("bad", 0.0)
+            total = good + bad
+            out.append({
+                "hour": key[-2:],
+                "goodPct": round(100.0 * good / total, 1) if total else None,
+                "monitored": round(total, 1),
+            })
+        return out
+
+
+# ----------------------------------------------------------- notification ----
+
+GLYPH = "\U000f0481"  # md-seat_recline_extra
+
+
+def notify(headline: str, body: str, urgency: str = "critical") -> None:
+    try:
+        subprocess.run(
+            ["omarchy", "notification", "send", "-u", urgency, "-g", GLYPH, headline, body],
+            capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"notify failed: {exc}")
+
+
+# ------------------------------------------------------------ state file ----
+
+def publish(state: str, detail: str, since: float, extra: dict | None = None) -> None:
+    payload = {
+        "state": state,
+        "detail": detail,
+        "since": since,
+        "updatedAt": time.time(),
+    }
+    payload.update(extra or {})
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    write_atomic(STATE_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+# ----------------------------------------------------------------- loop -----
+
+def run_daemon() -> int:
+    cfg = load_config()
+    engine = PoseEngine(cfg)
+    log("daemon starting")
+
+    state = "starting"
+    since = time.time()
+    bad_streak = away_streak = 0
+    last_notified = 0.0
+    history = History()
+    last_tick = time.time()
+    current_detail = ""       # reason attached to the state currently in force
+
+    while True:
+        cfg = load_config()          # picked up live, so the panel can retune
+        engine.cfg = cfg
+        try:
+            result = sample(cfg, engine)
+        except Exception as exc:                     # keep the daemon alive
+            log(f"sample error: {type(exc).__name__}: {exc}")
+            result = {"observation": "unavailable", "reason": "sample error"}
+
+        obs = result["observation"]
+
+        if obs == "bad":
+            bad_streak += 1
+            away_streak = 0
+        elif obs == "good":
+            bad_streak = away_streak = 0
+        elif obs == "away":
+            away_streak += 1
+            bad_streak = 0
+        else:
+            bad_streak = away_streak = 0
+
+        grace = int(cfg.get("graceSamples", 3))
+        away_after = int(cfg.get("awaySamples", 3))
+
+        if obs in ("paused", "unavailable", "uncalibrated"):
+            new_state = obs if obs != "unavailable" else (
+                "blocked" if result.get("reason") == "camera-blocked" else "unavailable")
+            detail = result.get("reason", "")
+            if obs == "uncalibrated":
+                detail = "run: posture calibrate"
+            elif new_state == "blocked":
+                detail = "the camera is covered"
+        elif obs == "away":
+            new_state = "away" if away_streak >= away_after else state
+            detail = "no one at the desk"
+        elif obs == "bad" and bad_streak >= grace:
+            new_state = "bad"
+            detail = ", ".join(result.get("reasons", [])) or "posture drifted"
+        elif obs == "bad":
+            new_state = "good" if state in ("good", "starting") else state
+            detail = "watching"
+        else:
+            new_state = "good"
+            detail = "posture looks good"
+
+        # Credit the elapsed cycle to whichever state was actually in force.
+        now = time.time()
+        history.add_time(state, now - last_tick, now)
+        last_tick = now
+
+        if new_state != state:
+            log(f"state {state} -> {new_state} ({detail})")
+            # Close the outgoing episode with its own reason, not the incoming
+            # one, so a recorded slouch says why it was a slouch.
+            history.add_episode(state, since, now, current_detail)
+            since = now
+            if new_state == "bad":
+                notify("Sit up", detail)
+                last_notified = now
+            state = new_state
+            current_detail = detail
+        elif state == "bad":
+            renotify = float(cfg.get("renotifySeconds", 300))
+            if time.time() - last_notified >= renotify:
+                mins = int((time.time() - since) // 60)
+                notify("Still slouching", f"{detail} ({mins} min)")
+                last_notified = time.time()
+
+        publish(state, detail, since, {
+            "metrics": result.get("metrics"),
+            "deltas": result.get("deltas"),
+            "confidence": result.get("confidence"),
+            "calibrated": bool(cfg.get("baseline")),
+            "sensitivity": cfg.get("sensitivity", 1.0),
+        })
+
+        # Refresh the live reason only from an observation that actually
+        # matches the state in force. A single "no person detected" frame does
+        # not end a slouch, and must not relabel it either.
+        if state == new_state and obs == state and detail:
+            current_detail = detail
+        history.add_sample(result.get("metrics"), state, now)
+        history.save(now)
+
+        # Chase a developing problem, idle when there is not one.
+        if bad_streak > 0 or state == "bad":
+            interval = float(cfg.get("fastIntervalSeconds", 2))
+        elif state == "away":
+            interval = float(cfg.get("awayIntervalSeconds", 15))
+        else:
+            interval = float(cfg.get("intervalSeconds", 6))
+        sleep_until_config_changes(max(1.0, interval))
+
+
+# ------------------------------------------------------------ calibrate -----
+
+def calibrate(samples: int = 10, countdown: int = 5) -> int:
+    cfg = load_config()
+    engine = PoseEngine(cfg)
+
+    print("Sit the way you want to be reminded to sit: back on the chair, "
+          "shoulders relaxed, eyes level with the screen.")
+    for i in range(countdown, 0, -1):
+        print(f"  capturing in {i}...", end="\r", flush=True)
+        time.sleep(1)
+    print("  capturing now.        ")
+
+    collected = []
+    for i in range(samples):
+        frames, err = Camera(cfg).grab(3)
+        if err:
+            print(f"  camera problem: {err}")
+            if err == "camera-blocked":
+                print("  The sensor is returning a blank image. Open the privacy "
+                      "shutter or remove the camera cover, then try again.")
+            return 2
+        got = []
+        for frame in frames:
+            lm, conf = engine.landmarks(frame)
+            if lm is None:
+                continue
+            one = metrics_from(lm, frame.shape)
+            if one:
+                got.append((conf, one))
+        if not got:
+            print(f"  sample {i+1}/{samples}: no person detected, retrying")
+            continue
+        merged = {k: statistics.median([r[k] for _, r in got]) for k in got[0][1]}
+        collected.append(merged)
+        conf = statistics.median([c for c, _ in got])
+        print(f"  sample {len(collected)}/{samples} ok (confidence {conf:.2f})")
+        time.sleep(0.3)
+
+    if len(collected) < max(3, samples // 3):
+        print("Not enough good samples. Make sure your head and both shoulders "
+              "are in frame, then run calibration again.")
+        return 3
+
+    baseline = {k: statistics.median([c[k] for c in collected]) for k in collected[0]}
+    cfg["baseline"] = baseline
+    cfg["calibratedAt"] = time.time()
+    save_config(cfg)
+
+    print("\nBaseline saved:")
+    for k, v in baseline.items():
+        print(f"  {k:16s} {v:8.4f}")
+    log(f"calibrated from {len(collected)} samples")
+    return 0
+
+
+# -------------------------------------------------------------- history -----
+
+def human(seconds: float) -> str:
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def bar(pct, width: int = 24) -> str:
+    if pct is None:
+        return "·" * width
+    filled = int(round(width * pct / 100.0))
+    return "█" * filled + "░" * (width - filled)
+
+
+def history_report(days: int = 7, as_json: bool = False) -> int:
+    hist = History()
+    now = time.time()
+
+    if as_json:
+        print(json.dumps({
+            "today": hist.day_totals(time.strftime("%Y-%m-%d", time.localtime(now))),
+            "recentHours": hist.recent_hours(now, 12),
+            "days": {d: hist.day_totals(d) for d in sorted(hist.data["days"])[-days:]},
+        }, indent=2))
+        return 0
+
+    today_key = time.strftime("%Y-%m-%d", time.localtime(now))
+    t = hist.day_totals(today_key)
+    if not t.get("monitored"):
+        print("No posture history recorded yet. The monitor needs to run for a while first.")
+        return 0
+
+    print("TODAY")
+    print(f"  monitored     {human(t['monitored'])}  (good {human(t.get('good', 0))}, "
+          f"bad {human(t.get('bad', 0))})")
+    print(f"  good posture  {bar(t['goodPct'])} {t['goodPct']}%")
+    print(f"  slouches      {t['badEpisodes']}   longest {human(t['longestBad'])}")
+    away, paused = t.get("away", 0), t.get("paused", 0)
+    if away or paused:
+        print(f"  not counted   away {human(away)}, paused {human(paused)}")
+
+    hours = [h for h in hist.recent_hours(now, 12) if h["monitored"] > 0]
+    if hours:
+        print("\nLAST 12 HOURS")
+        for h in hist.recent_hours(now, 12):
+            if h["monitored"] <= 0:
+                print(f"  {h['hour']}:00  {bar(None)}      idle")
+            else:
+                print(f"  {h['hour']}:00  {bar(h['goodPct'])} {h['goodPct']:5.1f}%  "
+                      f"{human(h['monitored'])}")
+
+    keys = sorted(hist.data["days"])[-days:]
+    if len(keys) > 1:
+        print(f"\nLAST {len(keys)} DAYS")
+        for d in keys:
+            row = hist.day_totals(d)
+            if not row.get("monitored"):
+                continue
+            label = time.strftime("%a %d %b", time.strptime(d, "%Y-%m-%d"))
+            print(f"  {label}  {bar(row['goodPct'])} {row['goodPct']:5.1f}%  "
+                  f"{human(row['monitored']):>7}  {row['badEpisodes']} slouches")
+
+    eps = [e for e in hist.data["episodes"] if e["state"] == "bad"][-5:]
+    if eps:
+        print("\nRECENT SLOUCHES")
+        for e in reversed(eps):
+            when = time.strftime("%a %H:%M", time.localtime(e["start"]))
+            print(f"  {when}  {human(e['seconds']):>6}  {e['detail'][:52]}")
+    return 0
+
+
+# ---------------------------------------------------------------- probe -----
+
+def probe() -> int:
+    cfg = load_config()
+    checks = {
+        "paused": paused(),
+        "sessionLocked": session_locked(),
+        "cameraBusy": camera_busy(),
+    }
+    for k, v in checks.items():
+        print(f"{k:16s} {v}")
+    frames, err = Camera(cfg).grab(1)
+    if err:
+        print(f"capture          FAILED ({err})")
+        if err == "camera-blocked":
+            print("\nThe camera streams frames but every pixel is identical, which "
+                  "means no light is reaching the sensor.\nCheck for a privacy "
+                  "shutter, a camera cover, or a hardware camera switch.")
+        return 1
+    import cv2 as cv
+    frame = frames[0]
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    print(f"capture          OK {frame.shape} mean={gray.mean():.1f} std={gray.std():.1f}")
+    lm, conf = PoseEngine(cfg).landmarks(frame)
+    print(f"pose             {'OK confidence %.2f' % conf if lm is not None else 'no person detected'}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Omarchy posture monitor")
+    ap.add_argument("command", nargs="?", default="run",
+                    choices=["run", "once", "calibrate", "probe", "history"])
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--samples", type=int, default=10)
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if args.debug:
+        os.environ["POSTURE_DEBUG"] = "1"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.command == "run":
+        return run_daemon()
+    if args.command == "calibrate":
+        return calibrate(samples=args.samples)
+    if args.command == "probe":
+        return probe()
+    if args.command == "history":
+        return history_report(days=args.days, as_json=args.json)
+
+    cfg = load_config()
+    result = sample(cfg, PoseEngine(cfg))
+    print(json.dumps(result, indent=2))
+    return 0 if result["observation"] in ("good", "bad", "uncalibrated") else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

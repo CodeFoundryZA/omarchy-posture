@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Remove everything this plugin installed outside its own directory.
+#
+# Run this BEFORE "omarchy plugin remove", because that only deletes the plugin
+# directory and would leave the user service behind.
+
+set -uo pipefail
+
+unit_name="omarchy-posture.service"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit_dst="$unit_dir/$unit_name"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/posture"
+plugin_id="io.github.codefoundryza.posture"
+
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+bold "Omarchy posture monitor: uninstall"
+echo
+
+if systemctl --user list-unit-files "$unit_name" >/dev/null 2>&1; then
+  systemctl --user disable --now "$unit_name" >/dev/null 2>&1
+  green "Stopped and disabled $unit_name"
+fi
+
+if [[ -e $unit_dst ]]; then
+  rm -f "$unit_dst"
+  systemctl --user daemon-reload
+  green "Removed $unit_dst"
+fi
+
+# The state directory holds the calibration baseline and posture history, which
+# are the only things here that cannot be regenerated. Never delete it silently.
+if [[ -d $state_dir ]]; then
+  echo
+  echo "Your calibration baseline and posture history live in:"
+  echo "    $state_dir"
+  if [[ -t 0 ]]; then
+    read -r -p "Delete them too? [y/N] " reply
+    if [[ ${reply,,} == y* ]]; then
+      rm -rf "$state_dir"
+      green "Removed $state_dir"
+    else
+      echo "Kept. Reinstalling later will pick up your existing calibration."
+    fi
+  else
+    echo "Kept. Delete it yourself if you want a clean slate."
+  fi
+fi
+
+echo
+bold "Now remove the plugin itself:"
+echo "    omarchy plugin remove $plugin_id"

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Finish installing the posture monitor: check dependencies, then install and
+# start the background service.
+#
+# This script deliberately never elevates privileges. Installing a system
+# package is left to you, so nothing here runs as root.
+
+set -uo pipefail
+
+plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+unit_name="omarchy-posture.service"
+unit_src="$plugin_dir/systemd/$unit_name"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit_dst="$unit_dir/$unit_name"
+
+red() { printf '\033[31m%s\033[0m\n' "$1"; }
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+bold "Omarchy posture monitor: install"
+echo
+
+missing=0
+
+if ! python3 -c 'import cv2' 2>/dev/null; then
+  red "Missing dependency: python-opencv"
+  echo "  Install it, then run this script again:"
+  echo "    omarchy pkg add python-opencv"
+  missing=1
+else
+  green "python-opencv found ($(python3 -c 'import cv2; print(cv2.__version__)' 2>/dev/null))"
+fi
+
+for cmd in jq v4l2-ctl fuser loginctl; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    red "Missing command: $cmd"
+    missing=1
+  fi
+done
+
+if [[ ! -e /dev/video0 ]]; then
+  red "No camera found at /dev/video0"
+  echo "  The plugin needs a webcam. Plug one in, then run this script again."
+  missing=1
+fi
+
+if ((missing)); then
+  echo
+  red "Install aborted: resolve the items above first."
+  exit 1
+fi
+
+# The plugin directory name must match the manifest id, because the shipped
+# unit file points at that exact path.
+expected_id="io.github.codefoundryza.posture"
+if [[ "$(basename "$plugin_dir")" != "$expected_id" ]]; then
+  red "Unexpected plugin directory: $(basename "$plugin_dir")"
+  echo "  It must be named '$expected_id' so the service can find the daemon."
+  echo "  Rename it, or edit ExecStart in $unit_src to match."
+  exit 1
+fi
+
+mkdir -p "$unit_dir"
+if [[ -e "$unit_dst" ]] && ! cmp -s "$unit_src" "$unit_dst"; then
+  echo "An existing $unit_name differs from the shipped one."
+  read -r -p "Overwrite it? [y/N] " reply
+  [[ ${reply,,} == y* ]] || { echo "Left your unit file alone. Nothing installed."; exit 1; }
+fi
+install -m 644 "$unit_src" "$unit_dst"
+green "Installed $unit_dst"
+
+systemctl --user daemon-reload
+systemctl --user enable --now "$unit_name" >/dev/null 2>&1
+if systemctl --user is-active --quiet "$unit_name"; then
+  green "Service running"
+else
+  red "Service failed to start. Check: systemctl --user status $unit_name"
+  exit 1
+fi
+
+echo
+bold "One step left: calibration"
+echo "The monitor cannot judge your posture until it knows what good looks like"
+echo "for your camera and desk. Sit the way you want to be reminded to sit, then:"
+echo
+echo "    $plugin_dir/bin/posture calibrate"
+echo
+echo "Then add the widget to your bar:"
+echo "    omarchy plugin enable $expected_id right"

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.codefoundryza.posture",
+  "name": "Posture",
+  "version": "1.0.0",
+  "author": "Nathan",
+  "description": "Watches your posture with the webcam and warns when you slouch.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Posture",
+    "description": "Turns red and notifies when your posture drifts from your calibrated baseline.",
+    "category": "Health",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLabel": false
+    },
+    "schema": [
+      { "key": "showLabel", "type": "boolean", "label": "Show text label next to the icon" }
+    ]
+  }
+}

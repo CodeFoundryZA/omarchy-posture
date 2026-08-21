@@ -1,0 +1,14 @@
+[Unit]
+Description=Omarchy posture monitor
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/io.github.codefoundryza.posture/bin/posture-daemon run
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

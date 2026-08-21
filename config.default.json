@@ -1,0 +1,24 @@
+{
+  "intervalSeconds": 6,
+  "graceSamples": 3,
+  "awaySamples": 3,
+  "renotifySeconds": 300,
+  "sensitivity": 1.0,
+  "minConfidence": 0.4,
+  "tolerance": {
+    "neckRatio": 0.14,
+    "scale": 0.16,
+    "frameY": 0.07,
+    "shoulderTiltDeg": 9.0,
+    "headTiltDeg": 13.0
+  },
+  "baseline": null,
+  "camera": {
+    "width": 640,
+    "height": 480,
+    "warmupFrames": 25,
+    "manualExposureFallback": true
+  },
+  "fastIntervalSeconds": 2,
+  "awayIntervalSeconds": 15
+}
