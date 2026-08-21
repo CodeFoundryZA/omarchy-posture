@@ -25,11 +25,13 @@ Usage: posture <command>
   stop         Stop the monitor
   restart      Restart the monitor
   calibrate    Record your good-posture baseline (stops/starts the monitor)
+               --profile <name> calibrates a separate seating setup
   pause        Suspend sampling (camera is left alone)
   resume       Resume sampling
   toggle       Pause or resume
   sensitivity  Show or set strictness, e.g. "posture sensitivity 1.4"
   history      Posture history: today, last 12 hours, last 7 days
+  profiles     List seating profiles; --use <name>, --remove <name>
   once         Take one sample and print JSON
   probe        Check camera health
   logs         Follow the daemon log
@@ -65,10 +67,11 @@ restart)
   systemctl --user restart "$unit" && echo "posture monitor restarted"
   ;;
 calibrate)
+  shift
   was_running=0
   running && was_running=1
   ((was_running)) && systemctl --user stop "$unit"
-  "$daemon" calibrate --samples "${2:-10}"
+  "$daemon" calibrate "$@"
   rc=$?
   ((was_running)) && systemctl --user start "$unit"
   exit $rc
@@ -101,6 +104,7 @@ sensitivity)
   fi
   ;;
 history) shift; "$daemon" history "$@" ;;
+profiles) shift; "$daemon" profiles "$@" ;;
 once) "$daemon" once ;;
 probe) "$daemon" probe ;;
 logs) tail -f "$log_file" ;;

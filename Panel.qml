@@ -221,6 +221,36 @@ Panel {
           }
         }
 
+        // No stored profile describes what the camera sees. Say that plainly
+        // instead of leaving a permanent "slouching" on screen.
+        Text {
+          visible: root.posture && root.posture.baselineStale
+          width: parent.width
+          text: "This does not match any calibrated setup, so posture is not "
+            + "being judged. Press C to calibrate this one"
+            + (root.posture && root.posture.profiles.length > 1
+                ? ", or switch setups with: posture profiles --use <name>" : "")
+            + "."
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // Which seating setup is in force, when there is more than one.
+        Text {
+          visible: root.posture && root.posture.profile !== ""
+            && root.posture.profiles.length > 1
+          width: parent.width
+          text: root.posture
+            ? "setup: " + root.posture.profile
+              + "   (" + root.posture.profiles.length + " calibrated)"
+            : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
         // Not calibrated is the one state where nothing else is meaningful.
         Text {
           visible: root.posture && !root.posture.calibrated

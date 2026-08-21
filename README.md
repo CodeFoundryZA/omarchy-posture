@@ -195,9 +195,32 @@ changed, `neckRatio` would have moved too and nothing happens, which is what
 stops this quietly re-baselining a slouch into the new normal. Set
 `drift.autoReanchor` to `false` to turn it off.
 
-You still want a full `posture calibrate` after a real setup change, such as a
-different desk or chair height. This handles the laptop being nudged, not a
-different sitting position.
+That handles the laptop being nudged. A genuinely different seating setup is a
+different problem, because your body geometry really does change and the
+re-anchor correctly refuses to fire. Profiles cover that case.
+
+### Profiles
+
+One profile is one calibrated seating setup.
+
+```bash
+posture calibrate --profile couch   # calibrate a second setup
+posture profiles                    # list them, * marks the active one
+posture profiles --use couch        # switch by hand
+posture profiles --remove couch
+```
+
+Once more than one exists, the daemon switches automatically to whichever
+profile fits the readings clearly better than the current one, weighting the
+scale-invariant metrics most heavily because they are the trustworthy ones.
+Your existing single baseline is migrated to a profile named `default`, so
+nothing is lost.
+
+If **no** profile fits, and posture has read bad for five minutes with not one
+good sample in between, that is a stale baseline rather than a person who has
+been slouching continuously. The widget switches to a `stale` state, says so,
+sends one notification and then stays quiet instead of nagging you every five
+minutes about a setup it cannot judge.
 
 ## States
 

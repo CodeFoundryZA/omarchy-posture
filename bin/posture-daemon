@@ -114,6 +114,19 @@ DEFAULT_CONFIG = {
         "cooldownSeconds": 120,
     },
     "baseline": None,
+    "activeProfile": "default",
+    "profiles": {},
+    # A different chair or room changes the body geometry itself, so the drift
+    # re-anchor deliberately cannot fire. Instead, notice that no baseline
+    # describes what the camera sees and say so, rather than reporting a
+    # permanent slouch.
+    "profileSwitch": {
+        "auto": True,
+        "windowSamples": 10,
+        "switchMargin": 0.6,     # a rival profile must fit this much better
+        "staleAfterSeconds": 300,
+        "staleFit": 1.8,         # no profile within this fits the readings
+    },
     "camera": {
         "width": 640,
         "height": 480,
@@ -162,12 +175,73 @@ def load_config() -> dict:
         user = json.loads(CONFIG_PATH.read_text())
     except (OSError, ValueError):
         user = {}
-    return deep_merge(DEFAULT_CONFIG, user)
+    return migrate_profiles(deep_merge(DEFAULT_CONFIG, user))
 
 
 def save_config(cfg: dict) -> None:
     ensure_state_dir()
     write_atomic(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+
+
+# -------------------------------------------------------------- profiles ----
+
+# A profile is one calibrated baseline for one seating setup. The desk and the
+# couch are different bodies as far as the geometry is concerned, so they need
+# separate baselines rather than one averaged compromise.
+
+def migrate_profiles(cfg: dict) -> dict:
+    """Fold a pre-profiles single baseline into the default profile."""
+    profiles = cfg.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    if not profiles and cfg.get("baseline"):
+        profiles["default"] = dict(cfg["baseline"])
+        if cfg.get("calibratedAt"):
+            profiles["default"]["calibratedAt"] = cfg["calibratedAt"]
+    cfg["profiles"] = profiles
+    if cfg.get("activeProfile") not in profiles:
+        cfg["activeProfile"] = next(iter(profiles), "default")
+    # `baseline` stays the live view of the active profile so every existing
+    # reader keeps working unchanged.
+    active = profiles.get(cfg["activeProfile"])
+    if active:
+        cfg["baseline"] = {k: v for k, v in active.items() if k != "calibratedAt"}
+    return cfg
+
+
+def set_active_profile(cfg: dict, name: str) -> bool:
+    if name not in cfg.get("profiles", {}):
+        return False
+    cfg["activeProfile"] = name
+    cfg["baseline"] = {k: v for k, v in cfg["profiles"][name].items() if k != "calibratedAt"}
+    return True
+
+
+# Metrics are weighted by how much they actually mean. neckRatio is
+# scale-invariant and measured 0.4% stable while sitting well, so it dominates;
+# the framing metrics are informative but move whenever the camera does.
+FIT_WEIGHTS = {"neckRatio": 3.0, "earNeckRatio": 2.0, "scale": 1.0, "frameY": 1.0}
+
+
+def profile_fit(metrics: dict, baseline: dict, tol: dict, sens: float) -> float:
+    """Weighted deviation from a baseline, in units of its own tolerance.
+
+    Below roughly 1.0 means the readings sit inside what that profile calls
+    normal. Large values mean this baseline does not describe this body.
+    """
+    total = weight = 0.0
+    for key, w in FIT_WEIGHTS.items():
+        if key not in metrics or key not in baseline:
+            continue
+        base = baseline[key]
+        allow = float(tol.get(key, tol.get("neckRatio", 0.14))) / max(0.2, sens)
+        if key == "frameY":
+            dev = abs(metrics[key] - base) / max(1e-6, allow)
+        else:
+            dev = abs(metrics[key] - base) / max(1e-6, abs(base) * allow)
+        total += w * dev
+        weight += w
+    return total / weight if weight else float("inf")
 
 
 # Everything under the state directory is a behavioural record of the person
@@ -529,6 +603,76 @@ def sample(cfg: dict, engine: PoseEngine):
     }
 
 
+# -------------------------------------------------------- profile matching --
+
+class ProfileMatcher:
+    """Pick the profile that describes what the camera is actually seeing.
+
+    Two jobs. If a different stored profile fits the readings clearly better
+    than the active one, switch to it, which is what makes moving between a
+    desk and a couch automatic once both are calibrated. If nothing fits, say
+    so: a baseline that describes no one is a stale baseline, not a person who
+    has been slouching without pause for five minutes, and reporting the latter
+    trains you to ignore the notifications.
+    """
+
+    def __init__(self):
+        self.samples: list = []
+        self.bad_since: float | None = None
+        self.saw_good = False
+
+    def note_state(self, state: str, now: float) -> None:
+        if state == "bad":
+            if self.bad_since is None:
+                self.bad_since = now
+        else:
+            if state == "good":
+                self.saw_good = True
+            self.bad_since = None
+
+    def observe(self, metrics: dict, cfg: dict, now: float):
+        """Returns (switched_to, stale_reason). Either may be None."""
+        opts = cfg.get("profileSwitch", {})
+        profiles = cfg.get("profiles", {})
+        if not metrics or not profiles:
+            return None, None
+
+        window = int(opts.get("windowSamples", 10))
+        self.samples.append(metrics)
+        self.samples = self.samples[-window:]
+        if len(self.samples) < window:
+            return None, None
+
+        med = {k: statistics.median([s[k] for s in self.samples if k in s])
+               for k in self.samples[-1]}
+        tol = cfg.get("tolerance", {})
+        sens = float(cfg.get("sensitivity", 1.0))
+        active = cfg.get("activeProfile")
+
+        scored = sorted(
+            ((profile_fit(med, b, tol, sens), name) for name, b in profiles.items()),
+            key=lambda pair: pair[0])
+        best_fit, best_name = scored[0]
+        active_fit = next((f for f, n in scored if n == active), float("inf"))
+
+        if (opts.get("auto", True) and best_name != active
+                and best_fit < active_fit * float(opts.get("switchMargin", 0.6))):
+            if set_active_profile(cfg, best_name):
+                save_config(cfg)
+                self.samples = []
+                self.bad_since = None
+                return best_name, None
+
+        # Nothing fits, and it has been that way for a while.
+        stale_after = float(opts.get("staleAfterSeconds", 300))
+        if (self.bad_since is not None and not self.saw_good
+                and now - self.bad_since > stale_after
+                and best_fit > float(opts.get("staleFit", 1.8))):
+            return None, (f"no calibration matches this setup "
+                          f"(closest is '{best_name}')")
+        return None, None
+
+
 # ---------------------------------------------------------------- drift -----
 
 class DriftTracker:
@@ -615,7 +759,7 @@ class DriftTracker:
 
 # --------------------------------------------------------------- history ----
 
-TRACKED_STATES = ("good", "bad", "away", "paused", "blocked")
+TRACKED_STATES = ("good", "bad", "away", "paused", "blocked", "stale")
 
 
 class History:
@@ -771,6 +915,8 @@ def run_daemon() -> int:
     last_notified = 0.0
     history = History()
     drift = DriftTracker()
+    matcher = ProfileMatcher()
+    stale_reason = None
     last_tick = time.time()
     current_detail = ""       # reason attached to the state currently in force
 
@@ -788,11 +934,20 @@ def run_daemon() -> int:
         # A camera move changes what "baseline" means, so any bad streak built
         # against the old framing is meaningless and must not survive it.
         if obs in ("good", "bad"):
-            moved = drift.observe(result.get("metrics"), cfg, time.time())
+            now_obs = time.time()
+            moved = drift.observe(result.get("metrics"), cfg, now_obs)
             if moved:
                 log(moved)
                 cfg = load_config()   # pick up the baseline just written
                 bad_streak = 0
+
+            switched, stale_reason = matcher.observe(result.get("metrics"), cfg, now_obs)
+            if switched:
+                log(f"switched to profile '{switched}'")
+                notify("Posture profile", f"Switched to '{switched}'", urgency="low")
+                cfg = load_config()
+                bad_streak = 0
+                stale_reason = None
         else:
             drift.reset()
 
@@ -822,6 +977,9 @@ def run_daemon() -> int:
         elif obs == "away":
             new_state = "away" if away_streak >= away_after else state
             detail = "no one at the desk"
+        elif stale_reason and obs == "bad":
+            new_state = "stale"
+            detail = stale_reason
         elif obs == "bad" and bad_streak >= grace:
             new_state = "bad"
             detail = ", ".join(result.get("reasons", [])) or "posture drifted"
@@ -835,6 +993,8 @@ def run_daemon() -> int:
         else:
             new_state = "good"
             detail = "posture looks good"
+
+        matcher.note_state(new_state, time.time())
 
         # Credit the elapsed cycle to whichever state was actually in force.
         now = time.time()
@@ -850,9 +1010,14 @@ def run_daemon() -> int:
             if new_state == "bad":
                 notify("Sit up", detail)
                 last_notified = now
+            elif new_state == "stale":
+                notify("Posture calibration looks stale",
+                       "This does not match any calibrated setup. "
+                       "Middle click the widget to recalibrate.",
+                       urgency="normal")
             state = new_state
             current_detail = detail
-        elif state == "bad":
+        elif state == "bad" and not stale_reason:
             renotify = float(cfg.get("renotifySeconds", 300))
             if time.time() - last_notified >= renotify:
                 mins = int((time.time() - since) // 60)
@@ -864,6 +1029,8 @@ def run_daemon() -> int:
             "deltas": result.get("deltas"),
             "confidence": result.get("confidence"),
             "calibrated": bool(cfg.get("baseline")),
+            "profile": cfg.get("activeProfile"),
+            "profiles": sorted(cfg.get("profiles", {}).keys()),
             "sensitivity": cfg.get("sensitivity", 1.0),
         })
 
@@ -887,10 +1054,12 @@ def run_daemon() -> int:
 
 # ------------------------------------------------------------ calibrate -----
 
-def calibrate(samples: int = 10, countdown: int = 5) -> int:
+def calibrate(samples: int = 10, countdown: int = 5, profile: str = None) -> int:
     cfg = load_config()
+    profile = profile or cfg.get("activeProfile") or "default"
     engine = PoseEngine(cfg)
 
+    print(f"Calibrating profile '{profile}'.")
     print("Sit the way you want to be reminded to sit: back on the chair, "
           "shoulders relaxed, eyes level with the screen.")
     for i in range(countdown, 0, -1):
@@ -930,14 +1099,15 @@ def calibrate(samples: int = 10, countdown: int = 5) -> int:
         return 3
 
     baseline = {k: statistics.median([c[k] for c in collected]) for k in collected[0]}
-    cfg["baseline"] = baseline
+    cfg.setdefault("profiles", {})[profile] = dict(baseline, calibratedAt=time.time())
+    set_active_profile(cfg, profile)
     cfg["calibratedAt"] = time.time()
     save_config(cfg)
 
-    print("\nBaseline saved:")
+    print(f"\nBaseline saved to profile '{profile}':")
     for k, v in baseline.items():
         print(f"  {k:16s} {v:8.4f}")
-    log(f"calibrated from {len(collected)} samples")
+    log(f"calibrated profile '{profile}' from {len(collected)} samples")
     return 0
 
 
@@ -1016,6 +1186,46 @@ def history_report(days: int = 7, as_json: bool = False) -> int:
     return 0
 
 
+def manage_profiles(use: str = None, remove: str = None) -> int:
+    cfg = load_config()
+    profiles = cfg.get("profiles", {})
+
+    if remove:
+        if remove not in profiles:
+            print(f"No profile named '{remove}'."); return 1
+        if len(profiles) == 1:
+            print("Refusing to remove the only profile; calibrate another first.")
+            return 1
+        del profiles[remove]
+        if cfg.get("activeProfile") == remove:
+            set_active_profile(cfg, next(iter(profiles)))
+        save_config(cfg)
+        print(f"Removed '{remove}'. Active profile is now '{cfg['activeProfile']}'.")
+        return 0
+
+    if use:
+        if not set_active_profile(cfg, use):
+            print(f"No profile named '{use}'. Calibrate it first:")
+            print(f"  posture calibrate --profile {use}")
+            return 1
+        save_config(cfg)
+        print(f"Active profile is now '{use}'.")
+        return 0
+
+    if not profiles:
+        print("No profiles yet. Run: posture calibrate"); return 0
+    active = cfg.get("activeProfile")
+    print("PROFILES")
+    for name, base in sorted(profiles.items()):
+        when = base.get("calibratedAt")
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if when else "unknown"
+        print(f"  {'*' if name == active else ' '} {name:14s} calibrated {stamp}"
+              f"   neckRatio {base.get('neckRatio', 0):.3f}")
+    print("\n  * = active. Switch with 'posture profiles --use <name>',")
+    print("  add one with 'posture calibrate --profile <name>'.")
+    return 0
+
+
 # ---------------------------------------------------------------- probe -----
 
 def probe() -> int:
@@ -1047,11 +1257,14 @@ def probe() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Omarchy posture monitor")
     ap.add_argument("command", nargs="?", default="run",
-                    choices=["run", "once", "calibrate", "probe", "history"])
+                    choices=["run", "once", "calibrate", "probe", "history", "profiles"])
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--samples", type=int, default=10)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--profile", default=None)
+    ap.add_argument("--use", default=None)
+    ap.add_argument("--remove", default=None)
     args = ap.parse_args()
 
     if args.debug:
@@ -1061,9 +1274,11 @@ def main() -> int:
     if args.command == "run":
         return run_daemon()
     if args.command == "calibrate":
-        return calibrate(samples=args.samples)
+        return calibrate(samples=args.samples, profile=args.profile)
     if args.command == "probe":
         return probe()
+    if args.command == "profiles":
+        return manage_profiles(use=args.use, remove=args.remove)
     if args.command == "history":
         return history_report(days=args.days, as_json=args.json)
 

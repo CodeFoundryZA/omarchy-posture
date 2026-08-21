@@ -42,7 +42,12 @@ Item {
   readonly property bool paused: state === "paused"
   readonly property bool blocked: state === "blocked"
   readonly property bool away: state === "away"
-  readonly property bool needsAttention: bad || blocked || (!calibrated && !!snapshot)
+  // Distinct from `stale` above, which means the daemon stopped writing.
+  // This means no calibrated profile describes what the camera is seeing.
+  readonly property bool baselineStale: state === "stale"
+  readonly property string profile: snapshot && snapshot.profile ? String(snapshot.profile) : ""
+  readonly property var profiles: snapshot && snapshot.profiles ? snapshot.profiles : []
+  readonly property bool needsAttention: bad || blocked || baselineStale || (!calibrated && !!snapshot)
 
   // The icon carries the state too, not just the colour: an upright seated
   // figure for good posture and a reclined one for bad, so the widget still
@@ -52,6 +57,7 @@ Item {
     if (blocked) return "󱜷"                        // md-webcam_off
     if (paused) return "󰏦"                         // md-pause_circle_outline
     if (!calibrated) return "󱄶"                    // md-crosshairs_question
+    if (baselineStale) return "󱄶"                  // md-crosshairs_question
     if (away) return "󰳄"                           // md-seat_outline, empty chair
     if (bad) return "󰒁"                            // md-seat_recline_extra, slouched
     return "󰒂"                                     // md-seat_recline_normal, upright
@@ -66,6 +72,7 @@ Item {
       case "bad": return "Fix your posture"
       case "away": return "No one at the desk"
       case "paused": return "Paused"
+      case "stale": return "Calibration looks stale"
       case "blocked": return "Camera is covered"
       case "unavailable": return "Camera unavailable"
       default: return state
