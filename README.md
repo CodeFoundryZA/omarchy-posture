@@ -1,4 +1,4 @@
-# Posture
+# OmaPosture
 
 Watches your posture through your webcam and tells you when you start slouching.
 The bar widget turns red and a critical notification fires when you drift from a
@@ -8,7 +8,7 @@ Runs entirely on your machine. No images are ever written to disk or sent
 anywhere: frames live in memory for the fraction of a second they are analysed
 and are then discarded. Only numbers are stored.
 
-![Posture panel and history report](preview.png)
+![OmaPosture panel and history report](preview.png)
 
 The panel shows how far each axis has drifted from your baseline, today's
 good-posture share, and a column per hour. `posture history` prints the same

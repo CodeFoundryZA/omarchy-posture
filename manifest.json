@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.codefoundryza.posture",
-  "name": "Posture",
+  "name": "OmaPosture",
   "version": "1.0.0",
   "author": "Nathan Grobler",
   "description": "Webcam posture monitor. Turns the bar red and notifies you when you start slouching. Runs fully offline and never stores images.",
@@ -15,7 +15,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Posture",
+    "displayName": "OmaPosture",
     "description": "Turns red and notifies when your posture drifts from your calibrated baseline.",
     "category": "Health",
     "allowMultiple": false,
