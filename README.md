@@ -148,9 +148,7 @@ how far you sit from the camera:
 ### Sensitivity
 
 Calibration records what good posture looks like for you. Sensitivity decides
-**how far you are allowed to drift from it before it complains.** It is one
-number that divides every tolerance at once, so you tune nagging with a single
-dial instead of five thresholds.
+**how far you are allowed to drift from it before it complains.**
 
 | Sensitivity | Head drop allowed | Side lean allowed | Feel |
 |---|---|---|---|
@@ -208,9 +206,6 @@ are tracked but excluded, so stepping out does not inflate your score.
 
 ## Implementation notes
 
-Two things about this machine shaped the design and are worth knowing before
-changing the inference path.
-
 **The upstream person detector is unusable here.** BlazePose normally locates
 its region of interest with a full-body person detector. That detector is
 trained on images containing most of a body, and on a desk webcam showing only
@@ -226,11 +221,6 @@ engine rejects the model's NHWC convolutions outright, so the pose model must
 use the default new engine. This is why the harmless
 `setPreferableTarget Targets are not supported by the new graph engine` warning
 appears in the log on every start.
-
-**Blank-frame detection uses standard deviation, not mean brightness.** The
-webcam's `brightness` control adds a flat DC offset, so a covered sensor can
-report a healthy-looking mean while every pixel is identical. `BLANK_STD`
-guards against reading that as a real image.
 
 ## Privacy
 
