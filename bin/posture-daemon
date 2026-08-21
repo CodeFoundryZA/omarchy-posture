@@ -54,12 +54,12 @@ BLANK_STD = 3.0
 def log(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a") as fh:
+        ensure_state_dir()
+        with open_private(LOG_PATH) as fh:
             fh.write(line + "\n")
         if LOG_PATH.stat().st_size > 512 * 1024:
             tail = LOG_PATH.read_text().splitlines()[-2000:]
-            LOG_PATH.write_text("\n".join(tail) + "\n")
+            write_atomic(LOG_PATH, "\n".join(tail) + "\n")
     except OSError:
         pass
     if os.environ.get("POSTURE_DEBUG"):
@@ -150,13 +150,49 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     write_atomic(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+
+
+# Everything under the state directory is a behavioural record of the person
+# sitting at this desk: when they were present, how they were sitting, and for
+# how long. On a shared machine that must not be readable by other local
+# accounts, so the directory is owner-only and every file is written 0600.
+STATE_DIR_MODE = 0o700
+STATE_FILE_MODE = 0o600
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=STATE_DIR_MODE)
+    try:
+        if (STATE_DIR.stat().st_mode & 0o777) != STATE_DIR_MODE:
+            STATE_DIR.chmod(STATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def harden_existing() -> None:
+    """Tighten anything written before this policy existed."""
+    ensure_state_dir()
+    for child in STATE_DIR.glob("*"):
+        try:
+            if child.is_file() and (child.stat().st_mode & 0o777) != STATE_FILE_MODE:
+                child.chmod(STATE_FILE_MODE)
+        except OSError:
+            pass
+
+
+def open_private(path: Path, mode: str = "a"):
+    """Append to a file that is created 0600 rather than umask-dependent."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, STATE_FILE_MODE)
+    return os.fdopen(fd, mode)
 
 
 def write_atomic(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, STATE_FILE_MODE)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
     os.replace(tmp, path)
 
 
@@ -538,7 +574,7 @@ class History:
         row = {"t": round(now, 1), "state": state}
         row.update({k: round(float(v), 4) for k, v in metrics.items()})
         try:
-            with HISTORY_PATH.open("a") as fh:
+            with open_private(HISTORY_PATH) as fh:
                 fh.write(json.dumps(row) + "\n")
         except OSError:
             return
@@ -618,7 +654,7 @@ def publish(state: str, detail: str, since: float, extra: dict | None = None) ->
         "updatedAt": time.time(),
     }
     payload.update(extra or {})
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     write_atomic(STATE_PATH, json.dumps(payload, indent=2) + "\n")
 
 
@@ -903,7 +939,7 @@ def main() -> int:
 
     if args.debug:
         os.environ["POSTURE_DEBUG"] = "1"
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    harden_existing()
 
     if args.command == "run":
         return run_daemon()

@@ -242,6 +242,15 @@ The camera is held for well under a second per sample and released between
 samples, so video calls are never blocked. If another application is using the
 camera the plugin skips that sample entirely rather than competing for it.
 
+What is stored is still a behavioural record: when you were at your desk, how
+you were sitting, and for how long. On a shared machine that should not be
+readable by other local accounts, so `~/.local/state/omarchy/posture` is created
+`0700` and every file in it is written `0600`. The service additionally runs
+with `UMask=0077`, so nothing it creates can depend on the session umask, and
+the daemon repairs the permissions of any file written before this policy
+existed. The unit also runs with `ProtectSystem=strict`, `ProtectHome=read-only`
+and `NoNewPrivileges`, writing only to its own state directory.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

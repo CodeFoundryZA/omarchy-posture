@@ -10,5 +10,20 @@ Restart=on-failure
 RestartSec=10
 Nice=10
 
+# Posture history is a behavioural record of the user. Anything this service
+# creates must be owner-only regardless of the session umask.
+UMask=0077
+
+# The service needs the camera and the user's own state directory, nothing more.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/omarchy/posture
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
 [Install]
 WantedBy=graphical-session.target

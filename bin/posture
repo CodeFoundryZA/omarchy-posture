@@ -12,7 +12,9 @@ log_file="$state_dir/daemon.log"
 daemon="$plugin_dir/bin/posture-daemon"
 unit="omarchy-posture.service"
 
+# Behavioural records: owner-only, never world readable.
 mkdir -p "$state_dir"
+chmod 700 "$state_dir" 2>/dev/null
 
 usage() {
   cat <<'EOF'
@@ -94,6 +96,7 @@ sensitivity)
     if [[ -f $config_file ]]; then jq --argjson s "$2" '.sensitivity = $s' "$config_file" >"$tmp"
     else printf '{"sensitivity": %s}\n' "$2" >"$tmp"; fi
     mv "$tmp" "$config_file"
+    chmod 600 "$config_file" 2>/dev/null
     echo "sensitivity set to $2"
   fi
   ;;
