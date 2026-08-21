@@ -150,7 +150,7 @@ Panel {
       onTextKey: function (text) {
         var key = String(text || "").toLowerCase()
         if (!root.posture) return
-        if (key === "c") root.posture.recalibrate()
+        if (key === "c") { root.posture.recalibrate(); root.close() }
         else if (key === "p") root.posture.togglePause()
         else if (key === "h") { root.posture.openHistory(); root.close() }
         // Keyboard route for values between the presets.

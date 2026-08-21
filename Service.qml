@@ -117,7 +117,14 @@ Item {
   }
 
   function togglePause() { run(["toggle"]) }
-  function recalibrate() { run(["calibrate"]) }
+  // Calibration is interactive: it counts down, then samples you for several
+  // seconds. Firing it detached ran it blind, with no countdown to sit up for
+  // and no way to abort, silently replacing the baseline with whatever posture
+  // happened to be in frame. It has to own a terminal.
+  function recalibrate() {
+    Quickshell.execDetached(["omarchy", "launch", "tui", "bash", "-lc",
+      root.cli + " calibrate; echo; read -n1 -r -p 'Press any key to close...'"])
+  }
   function setSensitivity(value) { run(["sensitivity", String(value)]) }
 
   // Opens the full report in a terminal; the panel only has room for today.
