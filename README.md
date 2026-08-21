@@ -8,6 +8,12 @@ Runs entirely on your machine. No images are ever written to disk or sent
 anywhere: frames live in memory for the fraction of a second they are analysed
 and are then discarded. Only numbers are stored.
 
+![Posture panel and history report](preview.png)
+
+The panel shows how far each axis has drifted from your baseline, today's
+good-posture share, and a column per hour. `posture history` prints the same
+data in a terminal along with a seven day trend and your recent slouches.
+
 ## Requirements
 
 - Omarchy 4 (Quattro) with the Quickshell shell

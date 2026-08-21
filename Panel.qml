@@ -199,7 +199,10 @@ Panel {
               wrapMode: Text.WordWrap
             }
             Text {
+              // The detail usually explains the state, but for "good" it just
+              // repeats the headline in lower case. Don't print it twice.
               visible: root.posture && root.posture.detail !== ""
+                && root.posture.detail.toLowerCase() !== root.posture.statusText.toLowerCase()
               width: parent.width
               text: root.posture ? root.posture.detail : ""
               color: root.bad ? root.urgent : root.dim
@@ -454,8 +457,8 @@ Panel {
 
         Text {
           width: parent.width
-          text: "C recalibrate   P " + (root.posture && root.posture.paused ? "resume" : "pause")
-            + "   H history   - / + fine tune   0 reset"
+          text: "C calibrate   P " + (root.posture && root.posture.paused ? "resume" : "pause")
+            + "   H history   -/+ tune   0 reset"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
