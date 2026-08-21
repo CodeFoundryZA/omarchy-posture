@@ -134,6 +134,19 @@ Item {
   }
   function setSensitivity(value) { run(["sensitivity", String(value)]) }
 
+  function useProfile(name) { run(["profiles", "--use", String(name)]) }
+
+  // Prompt for a name through the Omarchy menu, then calibrate it in a
+  // terminal, because calibration needs a visible countdown to sit up for.
+  function calibrateNewProfile() {
+    Quickshell.execDetached(["bash", "-lc",
+      "name=$(omarchy menu input 'Name this seating setup' --width 400) || exit 0; "
+      + "[ -n \"$name\" ] || exit 0; "
+      + "omarchy launch tui bash -lc "
+      + "\"" + root.cli + " calibrate --profile '$name'; echo; "
+      + "read -n1 -r -p 'Press any key to close...'\""])
+  }
+
   // Opens the full report in a terminal; the panel only has room for today.
   function openHistory() {
     Quickshell.execDetached(["omarchy", "launch", "tui", "bash", "-lc",

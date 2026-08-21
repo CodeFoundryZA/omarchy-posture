@@ -126,6 +126,11 @@ DEFAULT_CONFIG = {
         "switchMargin": 0.6,     # a rival profile must fit this much better
         "staleAfterSeconds": 300,
         "staleFit": 1.8,         # no profile within this fits the readings
+        # Picking a profile by hand has to stick. Without this the matcher
+        # reverted a manual choice within seconds, which made the panel chips
+        # look broken. The pin lapses if the chosen profile stops fitting at
+        # all, so a wrong pick still recovers on its own.
+        "pinSeconds": 600,
     },
     "camera": {
         "width": 640,
@@ -655,7 +660,14 @@ class ProfileMatcher:
         best_fit, best_name = scored[0]
         active_fit = next((f for f, n in scored if n == active), float("inf"))
 
-        if (opts.get("auto", True) and best_name != active
+        # A profile chosen by hand is pinned for a while, unless it has stopped
+        # describing the body at all, in which case the pin is worse than
+        # useless and auto-switching should resume.
+        pinned_at = float(cfg.get("profilePinnedAt", 0) or 0)
+        pin_held = (now - pinned_at < float(opts.get("pinSeconds", 600))
+                    and active_fit < float(opts.get("staleFit", 1.8)))
+
+        if (opts.get("auto", True) and not pin_held and best_name != active
                 and best_fit < active_fit * float(opts.get("switchMargin", 0.6))):
             if set_active_profile(cfg, best_name):
                 save_config(cfg)
@@ -1101,6 +1113,7 @@ def calibrate(samples: int = 10, countdown: int = 5, profile: str = None) -> int
     baseline = {k: statistics.median([c[k] for c in collected]) for k in collected[0]}
     cfg.setdefault("profiles", {})[profile] = dict(baseline, calibratedAt=time.time())
     set_active_profile(cfg, profile)
+    cfg["profilePinnedAt"] = time.time()
     cfg["calibratedAt"] = time.time()
     save_config(cfg)
 
@@ -1208,6 +1221,7 @@ def manage_profiles(use: str = None, remove: str = None) -> int:
             print(f"No profile named '{use}'. Calibrate it first:")
             print(f"  posture calibrate --profile {use}")
             return 1
+        cfg["profilePinnedAt"] = time.time()
         save_config(cfg)
         print(f"Active profile is now '{use}'.")
         return 0

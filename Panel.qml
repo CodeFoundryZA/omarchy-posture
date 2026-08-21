@@ -51,6 +51,17 @@ Panel {
     return false
   }
 
+  // Mirrors pendingSensitivity: hold the clicked value until the daemon
+  // confirms, so the chip does not snap back during the write round trip.
+  property string pendingProfile: ""
+
+  function profileOptions() {
+    var names = posture ? posture.profiles : []
+    var out = []
+    for (var i = 0; i < names.length; i++) out.push({ value: names[i], label: names[i] })
+    return out
+  }
+
   readonly property var sensitivityPresets: [
     { value: "0.7", label: "Relaxed",  tooltip: "Only real slouches. Allows a 20% head drop." },
     { value: "1.0", label: "Normal",   tooltip: "Your calibrated tolerance. Allows a 14% head drop." },
@@ -96,16 +107,21 @@ Panel {
   // so a failed write cannot leave a permanently wrong reading on screen.
   Timer {
     interval: 1000
-    running: root.pendingSensitivity > 0
+    running: root.pendingSensitivity > 0 || root.pendingProfile !== ""
     repeat: true
     property int waited: 0
     onTriggered: {
       waited++
-      var live = root.posture ? root.posture.sensitivity : -1
-      if (Math.abs(live - root.pendingSensitivity) < 0.05 || waited > 15) {
-        root.pendingSensitivity = -1
-        waited = 0
+      if (root.pendingSensitivity > 0) {
+        var live = root.posture ? root.posture.sensitivity : -1
+        if (Math.abs(live - root.pendingSensitivity) < 0.05 || waited > 15)
+          root.pendingSensitivity = -1
       }
+      if (root.pendingProfile !== "") {
+        if ((root.posture && root.posture.profile === root.pendingProfile) || waited > 15)
+          root.pendingProfile = ""
+      }
+      if (root.pendingSensitivity < 0 && root.pendingProfile === "") waited = 0
     }
   }
 
@@ -237,18 +253,58 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        // Which seating setup is in force, when there is more than one.
+        PanelSectionHeader {
+          visible: root.posture && root.posture.profile !== ""
+          width: parent.width
+          text: "SEATING SETUP"
+          foreground: root.dim
+          fontFamily: root.fontFamily
+        }
+
         Text {
           visible: root.posture && root.posture.profile !== ""
-            && root.posture.profiles.length > 1
           width: parent.width
-          text: root.posture
-            ? "setup: " + root.posture.profile
-              + "   (" + root.posture.profiles.length + " calibrated)"
-            : ""
+          text: root.posture && root.posture.profiles.length > 1
+            ? "Switches on its own when another setup fits better. Pick one to force it."
+            : "Calibrate a second setup for the couch or another desk, and it will switch between them on its own."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Flow {
+          visible: root.posture && root.posture.profile !== ""
+          width: parent.width
+          spacing: Style.space(6)
+
+          ButtonGroup {
+            options: root.profileOptions()
+            value: root.pendingProfile !== "" ? root.pendingProfile
+                                              : (root.posture ? root.posture.profile : "")
+            foreground: root.foreground
+            background: root.bar ? root.bar.background : Color.background
+            accent: Color.accent
+            fontFamily: root.fontFamily
+            focusable: false
+            onChanged: function (v) {
+              if (!root.posture) return
+              root.pendingProfile = v
+              root.posture.useProfile(v)
+            }
+          }
+
+          PanelActionButton {
+            iconText: "󰐕"
+            tooltipText: "Calibrate a new seating setup"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            onClicked: {
+              if (root.posture) root.posture.calibrateNewProfile()
+              root.close()
+            }
+          }
         }
 
         // Not calibrated is the one state where nothing else is meaningful.

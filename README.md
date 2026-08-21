@@ -210,11 +210,26 @@ posture profiles --use couch        # switch by hand
 posture profiles --remove couch
 ```
 
+The panel has the same controls: a chip per profile to switch, and a `+`
+button that asks for a name and then runs calibration in a terminal.
+
 Once more than one exists, the daemon switches automatically to whichever
-profile fits the readings clearly better than the current one, weighting the
-scale-invariant metrics most heavily because they are the trustworthy ones.
-Your existing single baseline is migrated to a profile named `default`, so
-nothing is lost.
+profile fits the readings clearly better than the current one. Your existing
+single baseline is migrated to a profile named `default`, so nothing is lost.
+
+There is no location awareness of any kind. The only question it asks is which
+stored baseline describes the body the camera is currently looking at.
+`profile_fit()` scores each profile as a weighted deviation in units of each
+metric's own tolerance, weighting `neckRatio` and `earNeckRatio` most heavily
+because they are the ones that survive the camera moving. Below about 1.0 means
+the readings sit inside what that profile calls normal. A rival profile has to
+score better than 0.6x the active one before it wins, because slouching and a
+different chair are on the same continuum: measured against a desk baseline,
+slouching at that desk scores 0.61 and a couch-like posture scores 1.39.
+
+Choosing a profile by hand pins it for ten minutes, so the matcher cannot
+immediately revert your choice. The pin lapses early if the pinned profile
+stops fitting at all, so a wrong pick still recovers on its own.
 
 If **no** profile fits, and posture has read bad for five minutes with not one
 good sample in between, that is a stale baseline rather than a person who has
