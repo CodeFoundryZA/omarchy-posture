@@ -1,6 +1,6 @@
 {
   "intervalSeconds": 6,
-  "graceSamples": 3,
+  "graceSamples": 5,
   "awaySamples": 3,
   "renotifySeconds": 300,
   "sensitivity": 1.0,
@@ -20,5 +20,6 @@
     "manualExposureFallback": true
   },
   "fastIntervalSeconds": 2,
-  "awayIntervalSeconds": 15
+  "awayIntervalSeconds": 15,
+  "recoverySamples": 2
 }

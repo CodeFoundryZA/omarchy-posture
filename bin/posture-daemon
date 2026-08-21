@@ -77,7 +77,15 @@ DEFAULT_CONFIG = {
     "intervalSeconds": 6,       # steady state, posture is fine
     "fastIntervalSeconds": 2,   # a bad reading is pending confirmation
     "awayIntervalSeconds": 15,  # nobody at the desk, no hurry
-    "graceSamples": 3,          # consecutive bad samples before alerting
+    # Entering "bad" needs sustained evidence. Measured on real use, 3 samples
+    # at the fast interval meant about 8s, which reaching for a mug was enough
+    # to trip: 81% of recorded slouches lasted under 30s and together accounted
+    # for only 8 of 58 bad minutes. Five samples is roughly 14s.
+    "graceSamples": 5,          # consecutive bad samples before alerting
+    # Leaving "bad" needs evidence too, otherwise one good frame ends the
+    # episode and the next bad one starts a new one, shredding a single slouch
+    # into a dozen entries.
+    "recoverySamples": 2,
     "awaySamples": 3,           # consecutive no-person samples before "away"
     "renotifySeconds": 300,
     "sensitivity": 1.0,         # higher is stricter
@@ -667,7 +675,7 @@ def run_daemon() -> int:
 
     state = "starting"
     since = time.time()
-    bad_streak = away_streak = 0
+    bad_streak = away_streak = good_streak = 0
     last_notified = 0.0
     history = History()
     last_tick = time.time()
@@ -686,14 +694,15 @@ def run_daemon() -> int:
 
         if obs == "bad":
             bad_streak += 1
-            away_streak = 0
+            good_streak = away_streak = 0
         elif obs == "good":
+            good_streak += 1
             bad_streak = away_streak = 0
         elif obs == "away":
             away_streak += 1
-            bad_streak = 0
+            bad_streak = good_streak = 0
         else:
-            bad_streak = away_streak = 0
+            bad_streak = away_streak = good_streak = 0
 
         grace = int(cfg.get("graceSamples", 3))
         away_after = int(cfg.get("awaySamples", 3))
@@ -715,6 +724,10 @@ def run_daemon() -> int:
         elif obs == "bad":
             new_state = "good" if state in ("good", "starting") else state
             detail = "watching"
+        elif state == "bad" and good_streak < int(cfg.get("recoverySamples", 2)):
+            # Sitting up for one sample is not recovery; hold the episode open.
+            new_state = "bad"
+            detail = current_detail or "posture drifted"
         else:
             new_state = "good"
             detail = "posture looks good"
