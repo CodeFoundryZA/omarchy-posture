@@ -138,13 +138,20 @@ Item {
 
   // Prompt for a name through the Omarchy menu, then calibrate it in a
   // terminal, because calibration needs a visible countdown to sit up for.
+  //
+  // The name reaches both shells as an argv element and never as script text.
+  // Interpolating it into the inner command string instead, as this first did,
+  // let a name containing a single quote close that string and run whatever
+  // followed it. `omarchy launch tui` execs its arguments, so positional
+  // parameters survive the trip into the terminal intact.
   function calibrateNewProfile() {
     Quickshell.execDetached(["bash", "-lc",
       "name=$(omarchy menu input 'Name this seating setup' --width 400) || exit 0; "
       + "[ -n \"$name\" ] || exit 0; "
-      + "omarchy launch tui bash -lc "
-      + "\"" + root.cli + " calibrate --profile '$name'; echo; "
-      + "read -n1 -r -p 'Press any key to close...'\""])
+      + "exec omarchy launch tui bash -lc "
+      + "'\"$1\" calibrate --profile \"$2\"; echo; "
+      + "read -n1 -r -p \"Press any key to close...\"' posture \"$0\" \"$name\"",
+      root.cli])
   }
 
   // Opens the full report in a terminal; the panel only has room for today.
