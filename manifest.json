@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.codefoundryza.posture",
   "name": "OmaPosture",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "author": "Nathan Grobler",
   "description": "Webcam posture monitor. Turns the bar red and notifies you when you start slouching. Runs fully offline and never stores images.",
   "kinds": [
