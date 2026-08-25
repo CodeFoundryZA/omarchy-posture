@@ -84,7 +84,10 @@ BarWidget {
 
     // active paints the widget with bar.urgent, so "go red" stays theme correct.
     active: root.posture ? root.posture.needsAttention : false
-    dimmed: root.posture ? (root.posture.away || root.posture.paused || root.posture.stale) : true
+    dimmed: root.posture
+      ? (!root.posture.needsSetup
+        && (root.posture.away || root.posture.paused || root.posture.stale))
+      : true
 
     text: {
       if (!root.posture) return "󰒂"
@@ -96,6 +99,12 @@ BarWidget {
 
     onPressed: function (mouseButton) {
       if (!root.posture) return
+      // Nothing to pause, recalibrate or report until setup finishes, and the
+      // panel would open on empty state, so every button runs setup instead.
+      if (root.posture.needsSetup) {
+        root.posture.runSetup()
+        return
+      }
       if (mouseButton === Qt.RightButton) root.posture.togglePause()
       else if (mouseButton === Qt.MiddleButton) root.posture.recalibrate()
       else root.toggle()

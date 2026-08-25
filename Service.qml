@@ -47,12 +47,46 @@ Item {
   readonly property bool baselineStale: state === "stale"
   readonly property string profile: snapshot && snapshot.profile ? String(snapshot.profile) : ""
   readonly property var profiles: snapshot && snapshot.profiles ? snapshot.profiles : []
-  readonly property bool needsAttention: bad || blocked || baselineStale || (!calibrated && !!snapshot)
+
+  // ---- first-run setup ----
+  //
+  // `omarchy plugin add` clones the repo and loads this, but a clone cannot
+  // install python-opencv or a systemd user unit, so a fresh install sits
+  // there inert. Rather than look broken, ask posture-setup-check what is
+  // still missing and let the widget offer to finish the job.
+  property var setupReport: null
+  property bool setupChecked: false
+  property int setupProbes: 0
+
+  readonly property bool setupReady: setupReport ? setupReport.ready === true : false
+  readonly property string setupBlocker: setupReport && setupReport.blocker
+    ? String(setupReport.blocker) : ""
+  readonly property string setupSummary: setupReport && setupReport.summary
+    ? String(setupReport.summary) : ""
+  // Nothing is claimed until the first check lands, so a slow check never
+  // flashes "needs setup" at someone whose monitor is running perfectly well.
+  readonly property bool needsSetup: setupChecked && !setupReady
+
+  readonly property string setupHint: {
+    switch (setupBlocker) {
+      case "opencv": return "Click to install python-opencv and start monitoring"
+      case "tools": return "Click to install the missing tools"
+      case "unit": return "Click to install the background service"
+      case "unit-stale": return "Click to update the background service"
+      case "camera": return "Plug in a webcam, then click to finish setup"
+      case "location": return "Click to see how to fix the plugin folder name"
+      default: return "Click to finish setting up the posture monitor"
+    }
+  }
+
+  readonly property bool needsAttention: needsSetup || bad || blocked || baselineStale
+    || (!calibrated && !!snapshot)
 
   // The icon carries the state too, not just the colour: an upright seated
   // figure for good posture and a reclined one for bad, so the widget still
   // reads correctly for anyone who cannot rely on the red.
   readonly property string glyph: {
+    if (needsSetup) return "󰯠"                    // md-wrench_outline
     if (stale || state === "unknown") return "󰘥"   // md-help_circle_outline
     if (blocked) return "󱜷"                        // md-webcam_off
     if (paused) return "󰏦"                         // md-pause_circle_outline
@@ -64,6 +98,7 @@ Item {
   }
 
   readonly property string statusText: {
+    if (needsSetup) return "Posture monitor needs setup"
     if (!snapshot) return "Posture monitor not running"
     if (stale) return "Posture monitor stopped"
     if (!calibrated) return "Not calibrated yet"
@@ -88,7 +123,14 @@ Item {
     return Math.floor(secs / 3600) + "h " + Math.floor((secs % 3600) / 60) + "m"
   }
 
-  readonly property string tooltipText: [
+  readonly property string tooltipText: {
+    // Before setup finishes there is nothing to pause or recalibrate, so
+    // promising those keys would only mislead.
+    if (needsSetup) {
+      return [statusText, setupSummary, setupHint]
+        .filter(function (line) { return line !== ""; }).join("\n")
+    }
+    return [
     statusText,
     detail ? detail : "",
     durationText ? "for " + durationText : "",
@@ -98,7 +140,8 @@ Item {
       : "",
     "",
     "Left click: details   Right click: pause   Middle click: recalibrate"
-  ].filter(function (line) { return line !== ""; }).join("\n")
+    ].filter(function (line) { return line !== ""; }).join("\n")
+  }
 
   // ---- history rollups, written by the daemon ----
   property var summary: null
@@ -161,6 +204,18 @@ Item {
   }
   function start() { run(["start"]) }
 
+  // Setup runs in a terminal rather than detached: it asks before it installs
+  // anything, and the password prompt `omarchy pkg add` raises has to land
+  // somewhere the user can actually answer it.
+  //
+  // The path travels as a positional parameter rather than as script text,
+  // for the same reason calibrateNewProfile does it that way.
+  function runSetup() {
+    Quickshell.execDetached(["omarchy", "launch", "tui", "bash", "-lc",
+      "\"$1\"; echo; read -n1 -r -p 'Press any key to close...'",
+      "posture-install", root.pluginDir + "/bin/posture-install"])
+  }
+
   function parse(content) {
     try {
       var parsed = JSON.parse(String(content || ""))
@@ -195,6 +250,43 @@ Item {
       }
     }
     onLoadFailed: root.summary = null
+  }
+
+  Process {
+    id: setupCheck
+    command: [root.pluginDir + "/bin/posture-setup-check"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(String(text || ""))
+          root.setupReport = (parsed && typeof parsed === "object") ? parsed : null
+        } catch (error) {
+          root.setupReport = null
+        }
+        root.setupChecked = true
+      }
+    }
+  }
+
+  // Polls quickly until the first answer lands, then slowly, then stops for
+  // good once setup is complete. After that the daemon's own state file says
+  // whether the monitor is alive, so there is nothing left to poll for.
+  //
+  // The probe cap covers a clone that arrived without the check script, or
+  // without the bit set on it. Retrying forever would log a failed spawn every
+  // couple of seconds for the life of the session, so give up and leave the
+  // widget behaving exactly as it did before any of this existed.
+  Timer {
+    interval: root.setupChecked ? 20000 : 2000
+    running: !root.setupReady && (root.setupChecked || root.setupProbes < 5)
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (setupCheck.running) return
+      root.setupProbes++
+      setupCheck.running = true
+    }
   }
 
   // Drives the time-derived bindings, and re-reads both files.

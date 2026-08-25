@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Report what still stands between a fresh clone and a working posture monitor.
+#
+# Prints one JSON object on stdout and exits 0 only when nothing is missing.
+# The bar widget polls this to decide whether to offer setup, and
+# posture-install runs it first, so both agree on what "ready" means.
+#
+# Read-only by design. The widget calls it on a timer, so it must never create,
+# move, install or start anything.
+#
+# It also leans on bash builtins rather than dirname, basename and cmp. A
+# script whose job is to report missing tools should not itself break when
+# tools are missing.
+
+set -uo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+source_dir="${source_path%/*}"
+[[ $source_dir == "$source_path" ]] && source_dir="."
+plugin_dir="$(cd -- "$source_dir/.." && pwd)"
+
+expected_id="io.github.codefoundryza.posture"
+unit_name="omarchy-posture.service"
+unit_src="$plugin_dir/systemd/$unit_name"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit_dst="$unit_dir/$unit_name"
+
+# The daemon opens /dev/video0 by name, so a webcam anywhere else is no help.
+device="/dev/video0"
+required_tools=(python3 jq v4l2-ctl fuser loginctl systemctl)
+
+bool() { if (($1)); then printf 'true'; else printf 'false'; fi; }
+
+missing_tools=()
+for cmd in "${required_tools[@]}"; do
+  command -v "$cmd" >/dev/null 2>&1 || missing_tools+=("$cmd")
+done
+tools=0
+((${#missing_tools[@]} == 0)) && tools=1
+
+opencv=0
+python3 -c 'import cv2' 2>/dev/null && opencv=1
+
+camera=0
+[[ -e $device ]] && camera=1
+
+# The shipped unit's ExecStart points at this exact path, so a plugin folder
+# under any other name installs a service that starts nothing.
+located=0
+[[ ${plugin_dir##*/} == "$expected_id" ]] && located=1
+
+unit=0
+[[ -f $unit_dst ]] && unit=1
+
+# An update that changes the unit leaves a stale copy behind in ~/.config.
+# Nothing warned about that before, so treat it as setup left to finish.
+unit_current=0
+((unit)) && [[ -r $unit_src && "$(<"$unit_src")" == "$(<"$unit_dst")" ]] && unit_current=1
+
+# Reported, but deliberately not part of `ready`: a stopped monitor is a
+# legitimate thing to want, and calling that "needs setup" would nag anyone
+# who ran `posture stop` on purpose.
+service=0
+systemctl --user is-active --quiet "$unit_name" 2>/dev/null && service=1
+
+# The first thing in the way, in the order setup resolves them.
+blocker=""
+summary=""
+if ((!located)); then
+  blocker="location"
+  summary="The plugin folder must be named $expected_id"
+elif ((!tools)); then
+  blocker="tools"
+  summary="Missing: ${missing_tools[*]}"
+elif ((!opencv)); then
+  blocker="opencv"
+  summary="Needs python-opencv"
+elif ((!camera)); then
+  blocker="camera"
+  summary="No camera at $device"
+elif ((!unit)); then
+  blocker="unit"
+  summary="Background service is not installed yet"
+elif ((!unit_current)); then
+  blocker="unit-stale"
+  summary="An update changed the background service"
+fi
+
+ready=0
+[[ -z $blocker ]] && ready=1
+
+# Hand-built rather than piped through jq, because jq is one of the tools this
+# script exists to report as missing. Every value below is either a fixed
+# string or a name from required_tools, so none of it needs escaping.
+printf '{"ready":%s,"blocker":"%s","summary":"%s",' \
+  "$(bool $ready)" "$blocker" "$summary"
+printf '"checks":{"location":%s,"tools":%s,"opencv":%s,"camera":%s,"unit":%s,"unitCurrent":%s,"service":%s},' \
+  "$(bool $located)" "$(bool $tools)" "$(bool $opencv)" "$(bool $camera)" \
+  "$(bool $unit)" "$(bool $unit_current)" "$(bool $service)"
+printf '"missingTools":['
+for i in "${!missing_tools[@]}"; do
+  ((i)) && printf ','
+  printf '"%s"' "${missing_tools[$i]}"
+done
+printf ']}\n'
+
+((ready)) || exit 1
+exit 0

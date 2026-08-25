@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Finish installing the posture monitor: check dependencies, then install and
-# start the background service.
+# Finish installing the posture monitor: resolve whatever posture-setup-check
+# reports as missing, then install and start the background service.
 #
-# This script deliberately never elevates privileges. Installing a system
-# package is left to you, so nothing here runs as root.
+# Nothing here elevates silently. A system package is offered, never assumed,
+# and the password prompt belongs to `omarchy pkg add` rather than to this
+# script. Declining any prompt stops setup and leaves the machine as it was.
+#
+# The bar widget runs this in a terminal when it sees setup left to finish, so
+# it has to explain itself on the way past.
 
 set -uo pipefail
 
-plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source_path="${BASH_SOURCE[0]}"
+source_dir="${source_path%/*}"
+[[ $source_dir == "$source_path" ]] && source_dir="."
+plugin_dir="$(cd -- "$source_dir/.." && pwd)"
+
+check="$plugin_dir/bin/posture-setup-check"
 unit_name="omarchy-posture.service"
 unit_src="$plugin_dir/systemd/$unit_name"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -17,73 +26,158 @@ red() { printf '\033[31m%s\033[0m\n' "$1"; }
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
-bold "Omarchy posture monitor: install"
+confirm() {
+  local reply
+  read -r -p "$1 [y/N] " reply || return 1
+  [[ ${reply,,} == y* ]]
+}
+
+# posture-setup-check reports jq as a dependency, so this cannot use jq to read
+# its output. Both fields are known-safe scalars, so a regex is enough.
+json_string() {
+  local key="$1" json="$2"
+  [[ $json =~ \"$key\":\"([^\"]*)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
+json_string_array() {
+  local key="$1" json="$2" raw
+  [[ $json =~ \"$key\":\[([^]]*)\] ]] || return 0
+  raw="${BASH_REMATCH[1]}"
+  raw="${raw//\"/}"
+  printf '%s' "${raw//,/ }"
+}
+
+package_for() {
+  case "$1" in
+  python3) printf 'python' ;;
+  jq) printf 'jq' ;;
+  v4l2-ctl) printf 'v4l-utils' ;;
+  fuser) printf 'psmisc' ;;
+  # systemctl and loginctl ship with systemd. If they are gone, installing a
+  # package is not the fix and pretending otherwise would hide a real problem.
+  *) printf '' ;;
+  esac
+}
+
+require_omarchy() {
+  command -v omarchy >/dev/null 2>&1 && return 0
+  red "The 'omarchy' command is not on PATH, so packages cannot be installed here."
+  return 1
+}
+
+install_unit() {
+  mkdir -p "$unit_dir" || return 1
+  if [[ -e $unit_dst ]] && [[ "$(<"$unit_src")" != "$(<"$unit_dst")" ]]; then
+    echo "An existing $unit_name differs from the one this version ships."
+    confirm "Replace it?" || {
+      red "Left your unit file alone. Nothing installed."
+      return 1
+    }
+  fi
+  install -m 644 "$unit_src" "$unit_dst" || return 1
+  green "Installed $unit_dst"
+}
+
+bold "Omarchy posture monitor: setup"
 echo
 
-missing=0
+# One blocker is resolved per pass, then the state is re-read rather than
+# assumed. If a pass leaves the same blocker standing, stop instead of looping.
+previous=""
+while true; do
+  report="$("$check")"
+  ready=$?
+  ((ready == 0)) && break
 
-if ! python3 -c 'import cv2' 2>/dev/null; then
-  red "Missing dependency: python-opencv"
-  echo "  Install it, then run this script again:"
-  echo "    omarchy pkg add python-opencv"
-  missing=1
-else
-  green "python-opencv found ($(python3 -c 'import cv2; print(cv2.__version__)' 2>/dev/null))"
-fi
+  blocker="$(json_string blocker "$report")"
+  summary="$(json_string summary "$report")"
 
-for cmd in jq v4l2-ctl fuser loginctl; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    red "Missing command: $cmd"
-    missing=1
+  if [[ $blocker == "$previous" ]]; then
+    red "Still blocked: $summary"
+    echo "  Nothing more this script can do on its own."
+    exit 1
   fi
+  previous="$blocker"
+
+  case "$blocker" in
+  location)
+    red "$summary"
+    echo "  Found: $plugin_dir"
+    echo "  The shipped service points at the expected path, so rename the"
+    echo "  folder, or edit ExecStart in $unit_src to match."
+    exit 1
+    ;;
+  tools)
+    read -r -a missing <<<"$(json_string_array missingTools "$report")"
+    packages=()
+    unfixable=()
+    for tool in "${missing[@]}"; do
+      package="$(package_for "$tool")"
+      if [[ -n $package ]]; then packages+=("$package"); else unfixable+=("$tool"); fi
+    done
+    if ((${#unfixable[@]})); then
+      red "Missing: ${unfixable[*]}"
+      echo "  These ship with systemd on an Omarchy system. Something is wrong"
+      echo "  with the base install that this script should not paper over."
+      exit 1
+    fi
+    red "Missing: ${missing[*]}"
+    echo "  Provided by: ${packages[*]}"
+    require_omarchy || exit 1
+    confirm "Install ${packages[*]}?" || {
+      red "Setup stopped. Nothing was installed."
+      exit 1
+    }
+    omarchy pkg add "${packages[@]}" || {
+      red "Package install failed."
+      exit 1
+    }
+    ;;
+  opencv)
+    red "Missing dependency: python-opencv"
+    echo "  The pose detector reads frames through it. It is an Arch package,"
+    echo "  so installing it asks for your password."
+    require_omarchy || exit 1
+    confirm "Install python-opencv?" || {
+      red "Setup stopped. Install it yourself with: omarchy pkg add python-opencv"
+      exit 1
+    }
+    omarchy pkg add python-opencv || {
+      red "python-opencv did not install."
+      exit 1
+    }
+    ;;
+  camera)
+    red "$summary"
+    echo "  The plugin needs a webcam. Plug one in, then run this again."
+    exit 1
+    ;;
+  unit | unit-stale)
+    install_unit || exit 1
+    ;;
+  *)
+    red "Unrecognised setup blocker: ${blocker:-none}"
+    exit 1
+    ;;
+  esac
 done
 
-if [[ ! -e /dev/video0 ]]; then
-  red "No camera found at /dev/video0"
-  echo "  The plugin needs a webcam. Plug one in, then run this script again."
-  missing=1
-fi
-
-if ((missing)); then
-  echo
-  red "Install aborted: resolve the items above first."
-  exit 1
-fi
-
-# The plugin directory name must match the manifest id, because the shipped
-# unit file points at that exact path.
-expected_id="io.github.codefoundryza.posture"
-if [[ "$(basename "$plugin_dir")" != "$expected_id" ]]; then
-  red "Unexpected plugin directory: $(basename "$plugin_dir")"
-  echo "  It must be named '$expected_id' so the service can find the daemon."
-  echo "  Rename it, or edit ExecStart in $unit_src to match."
-  exit 1
-fi
-
-mkdir -p "$unit_dir"
-if [[ -e "$unit_dst" ]] && ! cmp -s "$unit_src" "$unit_dst"; then
-  echo "An existing $unit_name differs from the shipped one."
-  read -r -p "Overwrite it? [y/N] " reply
-  [[ ${reply,,} == y* ]] || { echo "Left your unit file alone. Nothing installed."; exit 1; }
-fi
-install -m 644 "$unit_src" "$unit_dst"
-green "Installed $unit_dst"
+green "Everything the monitor needs is in place"
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$unit_name" >/dev/null 2>&1
-if systemctl --user is-active --quiet "$unit_name"; then
-  green "Service running"
-else
+if ! systemctl --user enable --now "$unit_name" >/dev/null 2>&1; then
+  red "Could not enable $unit_name"
+  echo "  Check: systemctl --user status $unit_name"
+  exit 1
+fi
+
+if ! systemctl --user is-active --quiet "$unit_name"; then
   red "Service failed to start. Check: systemctl --user status $unit_name"
   exit 1
 fi
 
+green "Posture monitor running"
 echo
-bold "One step left: calibration"
-echo "The monitor cannot judge your posture until it knows what good looks like"
-echo "for your camera and desk. Sit the way you want to be reminded to sit, then:"
-echo
-echo "    $plugin_dir/bin/posture calibrate"
-echo
-echo "Then add the widget to your bar:"
-echo "    omarchy plugin enable $expected_id right"
+echo "Now calibrate your good-posture baseline, either from the bar widget"
+echo "(middle click) or with:"
+echo "  $plugin_dir/bin/posture calibrate"
