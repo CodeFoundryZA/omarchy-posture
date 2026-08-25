@@ -20,22 +20,27 @@ data in a terminal along with a seven day trend and your recent slouches.
 - A webcam at `/dev/video0`
 - `python-opencv`, which pulls in `python-numpy`
 
-`jq`, `v4l2-ctl`, `fuser` and `loginctl` are also used and ship with Omarchy.
+Setup installs `python-opencv` for you, so the webcam and Omarchy 4 are the only
+things you have to bring. `jq`, `v4l2-ctl`, `fuser` and `loginctl` are also used
+and already ship with Omarchy.
 
 ## Installation
 
 ```bash
-# 1. the one dependency that is not already on an Omarchy system
-omarchy pkg add python-opencv
+omarchy plugin add https://github.com/CodeFoundryZA/omarchy-posture.git --enable
+```
 
-# 2. add the plugin
-omarchy plugin add https://github.com/CodeFoundryZA/omarchy-posture.git
+The widget arrives in your bar as a wrench, because cloning a repository cannot
+install an Arch package or a systemd user service. Click it and setup finishes
+the job in a terminal: it installs `python-opencv`, installs and starts the
+background service, and then hands you back a working monitor.
 
-# 3. install the background service
+Nothing is installed without asking first, and the password prompt belongs to
+`omarchy pkg add` rather than to this plugin. If you would rather drive it from
+a terminal, that same script is the one the widget runs:
+
+```bash
 ~/.config/omarchy/plugins/io.github.codefoundryza.posture/bin/posture-install
-
-# 4. show the widget in the bar
-omarchy plugin enable io.github.codefoundryza.posture right
 ```
 
 Then calibrate. This is required, not optional: absolute thresholds cannot work
